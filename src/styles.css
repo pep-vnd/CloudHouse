@@ -164,8 +164,12 @@ main { max-width: 1340px; padding: 30px 44px 35px; margin: auto; }
 .check-label input { width: 20px; height: 20px; accent-color: #32634c; }
 .muted { color: #8a947e; }.small { font-size: 11px; line-height: 1.65; }
 .camera-box { min-height: 190px; background: #e8eddf; border-radius: 12px; margin: 17px 0; overflow: hidden; color: #78916a; display: grid; align-items: center; justify-items: center; }
-.camera-box > div { width: 100%; }.camera-box:has(video) > svg { display: none; }.camera-box > div:empty { display: none; }
-.camera-box video { max-height: 300px; object-fit: cover; }
+.camera-box { position: relative; }
+.camera-host, .camera-reader { display: block; width: 100%; min-width: 0; }
+.camera-box > svg { position: absolute; pointer-events: none; }
+.camera-box:has(video) > svg { display: none; }
+/* El lector mide el contenedor vacío antes de insertar el vídeo. Nunca ocultarlo. */
+.camera-box video { display: block; width: 100% !important; height: auto; max-height: none; object-fit: contain; }
 .scanner-form { margin-top: 20px; }.attribution { margin: 17px 0 0 !important; text-align: center; }
 .inline-error { font-size: 12px; color: #aa5949; padding: 10px; background: #faede7; border-radius: 8px; margin-top: 10px; }
 .profile-options { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 23px 0; }

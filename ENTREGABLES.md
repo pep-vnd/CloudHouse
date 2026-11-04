@@ -614,15 +614,17 @@ function HouseholdApp({ account, onLogout }) {
 ### `src/components/ScannerModal.jsx`
 
 ```jsx
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Camera, ScanBarcode } from 'lucide-react';
 import Modal from './Modal.jsx';
 import { isValidBarcode } from '../lib/domain.js';
+import { createCameraSession } from '../lib/cameraSession.js';
 
 export default function ScannerModal({ onClose, onDetected, busy }) {
-  const id = `scanner-${useId().replace(/:/g, '')}`;
+  const host = useRef(null);
   const scanner = useRef(null);
-  const starting = useRef(null);
+  const startLock = useRef(false);
+  const attempt = useRef(0);
   const alive = useRef(true);
   const locked = useRef(false);
   const handler = useRef(onDetected);
@@ -631,15 +633,12 @@ export default function ScannerModal({ onClose, onDetected, busy }) {
   const [startingCamera, setStartingCamera] = useState(false);
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
-  async function stop() {
-    try { await starting.current; } catch { /* start() ya presenta su error en el modal. */ }
-    const reader = scanner.current;
-    if (reader) {
-      try { if (reader.isScanning) await reader.stop(); } catch { /* La pista puede haber sido cerrada por el navegador. */ }
-      try { reader.clear(); } catch { /* El contenedor puede haberse desmontado. */ }
-    }
+  function stop() {
+    attempt.current++;
+    scanner.current?.stop();
+    scanner.current = null;
   }
-  useEffect(() => () => { alive.current = false; void stop(); }, []);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; stop(); }; }, []);
   async function detect(raw) {
     if (!alive.current || locked.current) return;
     const barcode = raw.trim();
@@ -655,26 +654,36 @@ export default function ScannerModal({ onClose, onDetected, busy }) {
     } finally { locked.current = false; }
   }
   async function start() {
+    if (startLock.current || camera) return;
+    startLock.current = true;
+    const currentAttempt = ++attempt.current;
     setError(''); setStartingCamera(true);
+    let root;
     try {
       if (!window.isSecureContext || !navigator.mediaDevices) throw new Error('La cámara necesita HTTPS. Puedes escribir el código abajo.');
       const { Html5Qrcode, Html5QrcodeSupportedFormats } = await import('html5-qrcode');
-      if (!alive.current) return;
-      const reader = new Html5Qrcode(id, { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8], verbose: false });
-      scanner.current = reader;
-      starting.current = reader.start({ facingMode: 'environment' }, {
+      if (!alive.current || currentAttempt !== attempt.current) return;
+      root = document.createElement('div');
+      root.id = `scanner-${crypto.randomUUID()}`;
+      root.className = 'camera-reader';
+      host.current.append(root);
+      const reader = new Html5Qrcode(root.id, { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8], verbose: false });
+      const session = createCameraSession({ reader, root, config: {
         fps: 10, qrbox: (width, height) => ({ width: Math.max(50, Math.min(280, width - 24)), height: Math.max(50, Math.min(140, height - 24)) }),
-      }, raw => { void detect(raw); }, () => {});
-      await starting.current;
-      if (alive.current) setCamera(true);
+      }, onDetected: raw => { void detect(raw); } });
+      scanner.current = session;
+      await session.ready;
+      if (alive.current && currentAttempt === attempt.current) setCamera(true);
     } catch (err) {
-      if (alive.current) setError(err?.message || 'No se ha podido abrir la cámara. Revisa el permiso o escribe el código.');
-    } finally { if (alive.current) setStartingCamera(false); }
+      stop(); root?.remove();
+      if (alive.current && err?.name !== 'AbortError') setError(err?.message || 'No se ha podido abrir la cámara. Revisa el permiso o escribe el código.');
+    } finally { startLock.current = false; if (alive.current) setStartingCamera(false); }
   }
   return <Modal title="Escanear un producto" onClose={onClose} busy={busy}>
     <p className="muted">Apunta al código de barras. Si ya está en casa, sumaremos una unidad.</p>
-    <div className="camera-box"><div id={id} />{!camera && !startingCamera && <ScanBarcode size={70} strokeWidth={1} />}</div>
+    <div className="camera-box"><div ref={host} className="camera-host" />{!camera && !startingCamera && <ScanBarcode size={70} strokeWidth={1} />}</div>
     {!camera && <button className="button primary full" onClick={start} disabled={startingCamera || busy}><Camera size={19} />{startingCamera ? 'Abriendo cámara…' : 'Activar cámara'}</button>}
+    {(camera || startingCamera) && <button className="button secondary full" disabled={busy} onClick={() => { stop(); setCamera(false); }}>Apagar cámara</button>}
     <form className="form-stack scanner-form" onSubmit={e => { e.preventDefault(); void detect(code); }}>
       <label>También puedes escribir el código<input inputMode="numeric" autoComplete="off" maxLength={13} placeholder="EAN-8 o EAN-13" value={code} onChange={e => setCode(e.target.value)} required /></label>
       <button className="button secondary full" disabled={busy || startingCamera || !code}>{busy ? 'Buscando producto…' : 'Buscar producto'}</button>
@@ -1153,8 +1162,12 @@ main { max-width: 1340px; padding: 30px 44px 35px; margin: auto; }
 .check-label input { width: 20px; height: 20px; accent-color: #32634c; }
 .muted { color: #8a947e; }.small { font-size: 11px; line-height: 1.65; }
 .camera-box { min-height: 190px; background: #e8eddf; border-radius: 12px; margin: 17px 0; overflow: hidden; color: #78916a; display: grid; align-items: center; justify-items: center; }
-.camera-box > div { width: 100%; }.camera-box:has(video) > svg { display: none; }.camera-box > div:empty { display: none; }
-.camera-box video { max-height: 300px; object-fit: cover; }
+.camera-box { position: relative; }
+.camera-host, .camera-reader { display: block; width: 100%; min-width: 0; }
+.camera-box > svg { position: absolute; pointer-events: none; }
+.camera-box:has(video) > svg { display: none; }
+/* El lector mide el contenedor vacío antes de insertar el vídeo. Nunca ocultarlo. */
+.camera-box video { display: block; width: 100% !important; height: auto; max-height: none; object-fit: contain; }
 .scanner-form { margin-top: 20px; }.attribution { margin: 17px 0 0 !important; text-align: center; }
 .inline-error { font-size: 12px; color: #aa5949; padding: 10px; background: #faede7; border-radius: 8px; margin-top: 10px; }
 .profile-options { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 23px 0; }
@@ -1530,6 +1543,78 @@ export async function authenticateClients(clients) {
     const { error } = await db.auth.signInWithPassword({ email: usernameEmail(credentials.username), password: credentials.password });
     if (error) throw new Error('No se pudo autenticar la cuenta de pruebas.');
   }
+}
+```
+
+### `src/lib/cameraSession.js`
+
+```js
+// Mantiene cada intento aislado: un permiso tardío no puede reabrir el escáner cerrado.
+export function createCameraSession({ reader, root, config, onDetected, timeoutMs = 20000, observe = callback => new MutationObserver(callback) }) {
+  let cancelled = false;
+  let settled = false;
+  let started = false;
+  let timer;
+  let poll;
+  let resolveReady;
+  let rejectReady;
+  let stopping;
+  const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  const video = () => root.querySelector('video');
+  const stopTracks = () => {
+    const surface = video();
+    surface?.srcObject?.getTracks().forEach(track => track.stop());
+    return Boolean(surface);
+  };
+  const releaseReader = () => {
+    if (started && !stopping && reader.isScanning) stopping = Promise.resolve().then(() => reader.stop()).catch(() => {});
+  };
+  function inspect() {
+    if (cancelled) {
+      if (stopTracks()) observer.disconnect();
+      releaseReader();
+      return;
+    }
+    const surface = video();
+    if (!surface) return;
+    surface.muted = true;
+    surface.playsInline = true;
+    surface.setAttribute('playsinline', '');
+    surface.setAttribute('webkit-playsinline', '');
+    if (started && surface.readyState >= 2 && !surface.paused && surface.videoWidth > 0 && surface.clientWidth > 0 && surface.clientHeight > 0) {
+      settled = true; clearTimeout(timer); clearInterval(poll);
+      observer.disconnect(); resolveReady();
+    }
+  }
+  const observer = observe(inspect);
+  observer.observe(root, { childList: true, subtree: true });
+  function stop() {
+    if (cancelled) return;
+    cancelled = true; clearTimeout(timer); clearInterval(poll);
+    if (!settled) { settled = true; rejectReady(new DOMException('Cámara cerrada', 'AbortError')); }
+    inspect();
+    // Conservamos el observador del nodo separado mientras un permiso siga pendiente.
+    // Si aparece un stream más tarde, inspect() lo apaga inmediatamente.
+    root.remove();
+  }
+  timer = setTimeout(() => {
+    if (!settled) {
+      settled = true;
+      rejectReady(new Error('La cámara no ha mostrado imagen. Pulsa «Activar cámara» para reintentarlo o escribe el código.'));
+      stop();
+    }
+  }, timeoutMs);
+  poll = setInterval(inspect, 100);
+  Promise.resolve().then(() => {
+    if (cancelled) return;
+    return reader.start({ facingMode: 'environment' }, config, raw => { if (!cancelled) onDetected(raw); }, () => {});
+  }).then(() => { started = true; inspect(); }).catch(error => {
+    started = true;
+    if (!settled) { settled = true; rejectReady(error); }
+    stop();
+    observer.disconnect();
+  });
+  return { ready, stop };
 }
 ```
 
