@@ -156,6 +156,83 @@ begin
   end loop;
 end $$;
 commit;
+
+-- Horarios y organización familiar (migración 20261104).
+begin;
+alter table public.household_tasks
+  add column if not exists scheduled_days smallint[] not null default '{0,1,2,3,4,5,6}',
+  add column if not exists time_of_day text not null default 'flexible',
+  add column if not exists scheduled_time time,
+  add column if not exists notes text not null default '',
+  add column if not exists completed_dates date[] not null default '{}';
+alter table public.household_tasks drop constraint if exists task_scheduled_days;
+alter table public.household_tasks add constraint task_scheduled_days check (
+  cardinality(scheduled_days) > 0 and scheduled_days <@ array[0,1,2,3,4,5,6]::smallint[]
+);
+alter table public.household_tasks drop constraint if exists task_time_of_day;
+alter table public.household_tasks add constraint task_time_of_day check (
+  time_of_day in ('manana','mediodia','tarde','noche','flexible')
+);
+alter table public.weekly_menu add column if not exists is_skipped boolean not null default false;
+
+create or replace function public.set_task_completion(p_id uuid, p_date date, p_completed boolean)
+returns public.household_tasks language plpgsql security invoker set search_path = public as $$
+declare result public.household_tasks;
+begin
+  if p_date is null or p_completed is null then raise exception 'Faltan la fecha o el estado'; end if;
+  update public.household_tasks set
+    completed_dates = case when p_completed then
+      array(select distinct unnest(array_append(completed_dates, p_date)))
+      else array_remove(completed_dates, p_date) end,
+    is_completed = p_completed
+  where id = p_id returning * into result;
+  if not found then raise exception 'La tarea ya no existe'; end if;
+  return result;
+end;
+$$;
+
+create or replace function public.reset_task_period(p_frequency text, p_date date)
+returns void language plpgsql security invoker set search_path = public as $$
+declare first_day date; last_day date;
+begin
+  if p_frequency not in ('diaria','semanal') or p_date is null then raise exception 'Periodo inválido'; end if;
+  first_day := case when p_frequency = 'semanal' then date_trunc('week', p_date)::date else p_date end;
+  last_day := case when p_frequency = 'semanal' then first_day + 6 else p_date end;
+  update public.household_tasks t set completed_dates = array(
+    select d from unnest(t.completed_dates) d where d < first_day or d > last_day
+  ), is_completed = false where frequency = p_frequency;
+end;
+$$;
+revoke all on function public.set_task_completion(uuid,date,boolean), public.reset_task_period(text,date) from public;
+grant execute on function public.set_task_completion(uuid,date,boolean), public.reset_task_period(text,date) to anon, authenticated;
+commit;
+
+-- Plantillas de menú compartidas, sin datos personales en el código.
+begin;
+create table if not exists public.menu_templates (
+  id uuid primary key default gen_random_uuid(),
+  day_of_week text not null check (day_of_week in ('Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo')),
+  meal_type text not null check (meal_type in ('comida','cena')),
+  dish_name text not null check (length(trim(dish_name)) between 1 and 200),
+  notes text not null default '',
+  missing_ingredients text not null default '',
+  unique(day_of_week, meal_type)
+);
+alter table public.menu_templates enable row level security;
+grant select, insert, update, delete on public.menu_templates to anon, authenticated;
+drop policy if exists family_access on public.menu_templates;
+create policy family_access on public.menu_templates for all to anon, authenticated using (true) with check (true);
+do $$ begin
+  if not exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'menu_templates') then
+    alter publication supabase_realtime add table public.menu_templates;
+  end if;
+end $$;
+-- Copia inicial del menú ya registrado, sin incluir sus datos en este script.
+insert into public.menu_templates (day_of_week,meal_type,dish_name,notes,missing_ingredients)
+select day_of_week,meal_type,dish_name,notes,missing_ingredients from public.weekly_menu
+where week_start = (select min(week_start) from public.weekly_menu) and not is_skipped
+on conflict (day_of_week,meal_type) do nothing;
+commit;
 ```
 
 ## 8. Código completo del servicio de conexión y Open Food Facts
@@ -229,16 +306,16 @@ export async function lookupBarcode(barcode, { signal } = {}) {
 
 ```javascript
 import { supabase, unwrap, configurationError } from './supabaseClient.js';
-import { nextQuantity } from '../lib/domain.js';
+import { nextQuantity, dateKey, monday, shiftDate } from '../lib/domain.js';
 
-const TABLES = ['inventory_items', 'household_tasks', 'weekly_menu'];
+const TABLES = ['inventory_items', 'household_tasks', 'weekly_menu', 'menu_templates'];
 const LOCAL_KEY = 'cloudhouse.local.v1';
 const CACHE_KEY = 'cloudhouse.cloud-cache.v1';
 const empty = () => Object.fromEntries(TABLES.map(t => [t, []]));
 function read(key) {
   try {
     const value = JSON.parse(localStorage.getItem(key));
-    return value && TABLES.every(t => Array.isArray(value[t])) ? value : empty();
+    return value && Array.isArray(value.inventory_items) && TABLES.every(t => value[t] === undefined || Array.isArray(value[t])) ? { ...empty(), ...value } : empty();
   } catch { return empty(); }
 }
 export function cachedHousehold() { return read(supabase ? CACHE_KEY : LOCAL_KEY); }
@@ -348,10 +425,26 @@ export const household = {
     if (supabase) return unwrap(supabase.from('household_tasks').insert(task));
     return localWrite(data => data.household_tasks.push({ ...task, id: crypto.randomUUID(), is_completed: false }));
   },
-  async resetTasks(frequency) {
+  async completeTask(id, date, completed) {
     ensureOnline();
-    if (supabase) return unwrap(supabase.from('household_tasks').update({ is_completed: false }).eq('frequency', frequency));
-    return localWrite(data => data.household_tasks.filter(t => t.frequency === frequency).forEach(t => { t.is_completed = false; }));
+    if (supabase) return unwrap(supabase.rpc('set_task_completion', { p_id: id, p_date: date, p_completed: completed }));
+    return localWrite(data => {
+      const task = data.household_tasks.find(t => t.id === id);
+      if (!task) throw new Error('La tarea ya no existe');
+      const dates = new Set(task.completed_dates || []);
+      if (completed) dates.add(date); else dates.delete(date);
+      task.completed_dates = [...dates]; task.is_completed = completed;
+    });
+  },
+  async resetTasks(frequency, date = dateKey()) {
+    ensureOnline();
+    if (supabase) return unwrap(supabase.rpc('reset_task_period', { p_frequency: frequency, p_date: date }));
+    const first = frequency === 'semanal' ? monday(new Date(`${date}T12:00:00`)) : date;
+    const last = frequency === 'semanal' ? shiftDate(first, 6) : date;
+    return localWrite(data => data.household_tasks.filter(t => t.frequency === frequency).forEach(t => {
+      t.completed_dates = (t.completed_dates || []).filter(d => d < first || d > last);
+      t.is_completed = false;
+    }));
   },
   async saveMeal(meal) {
     ensureOnline();
@@ -466,7 +559,7 @@ export default function App() {
         {loading ? <div className="empty-state"><RefreshCw className="spin" /><p>Preparando tu hogar…</p></div> : <fieldset className="view-fieldset">
           {(tab === 'inventory' || tab === 'shopping') && <InventoryView items={data.inventory_items} shopping={tab === 'shopping'} onTab={changeTab} onAdd={() => setProduct({})} onEdit={setProduct} onScan={() => setScanner(true)} busy={busy} run={run} />}
           {tab === 'tasks' && <TasksView tasks={data.household_tasks} profile={profile || 'Hijo'} busy={busy} run={run} />}
-          {tab === 'menu' && <MenuView meals={data.weekly_menu} busy={busy} run={run} />}
+          {tab === 'menu' && <MenuView meals={data.weekly_menu} templates={data.menu_templates} busy={busy} run={run} />}
         </fieldset>}
         <footer className="main-footer"><Heart size={13} />Menos pendientes. Más hogar.<button onClick={() => setSettings(true)}><Cloud size={14} />{stateText}</button></footer>
       </main>
@@ -603,41 +696,82 @@ export default function InventoryView({ items, shopping, onTab, onAdd, onEdit, o
 ### `src/components/TasksView.jsx`
 
 ```jsx
-import { useState } from 'react';
-import { Check, Plus, RotateCcw, Sparkles, Trash2, CalendarDays } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Check, Plus, RotateCcw, Sparkles, Trash2, Clock } from 'lucide-react';
 import Modal from './Modal.jsx';
 import { household } from '../services/householdService.js';
-import { dateKey, isDueToday } from '../lib/domain.js';
+import { DAYS, dateKey, monday, shiftDate } from '../lib/domain.js';
+import { dayIndex, PERIODS, taskOccursOn, taskCompletedOn, periodHasCompletions, scheduleLabel } from '../lib/familySchedule.js';
 
 export default function TasksView({ tasks, profile, busy, run }) {
   const [filter, setFilter] = useState('Todas');
   const [form, setForm] = useState(null);
   const [reset, setReset] = useState(null);
   const [deleting, setDeleting] = useState(null);
-  const today = dateKey();
-  const selected = tasks.filter(t => filter === 'Todas' || t.assigned_to === filter || t.assigned_to === 'Ambos');
-  const due = selected.filter(t => isDueToday(t, today));
-  const completed = due.filter(t => t.is_completed).length;
-  const progress = due.length ? Math.round(completed / due.length * 100) : 0;
+  const [today, setToday] = useState(dateKey);
+  const [chosenDay, setChosenDay] = useState(null);
+  useEffect(() => {
+    const timer = setInterval(() => setToday(dateKey()), 30000);
+    return () => clearInterval(timer);
+  }, []);
+  const week = monday(new Date(`${today}T12:00:00`));
+  const selectedDate = chosenDay === null ? today : shiftDate(week, chosenDay);
+  const selectedIndex = dayIndex(selectedDate);
+  const selected = tasks.filter(t => (filter === 'Todas' || t.assigned_to === filter || t.assigned_to === 'Ambos') && taskOccursOn(t, selectedDate));
+  const completed = selected.filter(t => taskCompletedOn(t, selectedDate)).length;
+  const progress = selected.length ? Math.round(completed / selected.length * 100) : 0;
+  const isToday = selectedDate === today;
   async function save(e) {
     e.preventDefault();
-    const value = { ...form, title: form.title.trim(), due_date: form.due_date || null };
-    if (!value.title) return;
+    const value = { ...form, title: form.title.trim(), due_date: form.due_date || null, scheduled_time: form.scheduled_time || null };
+    if (!value.title || !value.scheduled_days.length) return;
     if (await run(() => household.addTask(value), 'Nueva tarea añadida')) setForm(null);
   }
+  function addTask() {
+    setForm({ title: '', assigned_to: profile, frequency: 'diaria', due_date: '', scheduled_days: [0, 1, 2, 3, 4, 5, 6], time_of_day: 'flexible', scheduled_time: '', notes: '', completed_dates: [] });
+  }
   return <>
-    <div className="page-heading"><div><div className="eyebrow">CUIDAR LA CASA ES COSA DE DOS</div><h1>Un pequeño esfuerzo.<br className="desktop-break" /> Un gran equipo.</h1><p>Repartimos las tareas. Compartimos la tranquilidad.</p></div><button className="button primary" onClick={() => setForm({ title: '', assigned_to: profile, frequency: 'diaria', due_date: '' })}><Plus size={19} />Nueva tarea</button></div>
-    <div className="progress-card"><div className="progress-copy"><span className="eyebrow">ASÍ VA EL DÍA</span><h2>{due.length && completed === due.length ? '¡Buen trabajo, equipo!' : 'Cada tarea cuenta.'}</h2><p>{completed} de {due.length} tareas de hoy completadas</p></div><div className="progress-number">{progress}<span>%</span></div><div className="progress-track" role="progressbar" aria-label="Tareas de hoy completadas" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}><div style={{ width: `${progress}%` }} /></div></div>
-    <div className="tasks-toolbar"><div className="pills">{[['Todas', 'Todas'], ['Hijo', 'Mis tareas (Hijo)'], ['Padre', 'Tareas de Papá']].map(([key, text]) => <button key={key} className={`pill ${filter === key ? 'active' : ''}`} aria-pressed={filter === key} onClick={() => setFilter(key)}>{text}</button>)}</div><span className="muted small">Las tareas de «Ambos» aparecen en los dos perfiles.</span></div>
-    <div className="task-list">{selected.length ? [...selected].sort((a, b) => Number(a.is_completed) - Number(b.is_completed) || (a.due_date || today).localeCompare(b.due_date || today)).map(task => <article key={task.id} className={`task-card ${task.is_completed ? 'completed' : ''}`}>
-      <button className="task-checkbox" role="checkbox" aria-checked={task.is_completed} aria-label={`Completar ${task.title}`} disabled={busy} onClick={() => run(() => household.update('household_tasks', task.id, { is_completed: !task.is_completed }))}>{task.is_completed && <Check size={24} />}</button>
-      <div className="task-info"><h3>{task.title}</h3><div><span className={`assignee ${task.assigned_to === 'Hijo' ? 'son' : ''}`}>{task.assigned_to === 'Padre' ? 'Papá' : task.assigned_to}</span><span>{task.frequency === 'diaria' ? 'Cada día' : task.frequency === 'semanal' ? 'Cada semana' : 'Una vez'}</span>{task.due_date && <span className={task.due_date < today && !task.is_completed ? 'overdue' : ''}><CalendarDays size={13} />{new Date(`${task.due_date}T12:00:00`).toLocaleDateString('es', { day: 'numeric', month: 'short' })}</span>}</div></div>
-      <button className="icon-button muted" disabled={busy} aria-label={`Eliminar ${task.title}`} onClick={() => setDeleting(task)}><Trash2 size={17} /></button>
-    </article>) : <div className="empty-state"><Sparkles size={36} /><h3>Una casa que cuidamos juntos</h3><p>Añade la primera tarea y elige quién se encarga.</p></div>}</div>
-    <div className="reset-panel"><div><h3>Empezamos de nuevo</h3><p>Reinicia las tareas recurrentes de ambos sin volver a escribirlas.</p></div><div className="reset-buttons"><button className="button secondary" disabled={busy || !tasks.some(t => t.frequency === 'diaria' && t.is_completed)} onClick={() => setReset('diaria')}><RotateCcw size={16} />Reiniciar día</button><button className="button secondary" disabled={busy || !tasks.some(t => t.frequency === 'semanal' && t.is_completed)} onClick={() => setReset('semanal')}><RotateCcw size={16} />Reiniciar semana</button></div></div>
-    {form && <Modal title="Una nueva tarea" onClose={() => setForm(null)} busy={busy}><form className="form-stack" onSubmit={save}><label>¿Qué hay que hacer?<input autoFocus value={form.title} required maxLength={200} placeholder="Por ejemplo, vaciar el lavavajillas" onChange={e => setForm({ ...form, title: e.target.value })} /></label><div className="form-row"><label>¿Quién se encarga?<select value={form.assigned_to} onChange={e => setForm({ ...form, assigned_to: e.target.value })}><option value="Padre">Papá</option><option>Hijo</option><option>Ambos</option></select></label><label>Frecuencia<select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value })}><option value="diaria">Cada día</option><option value="semanal">Cada semana</option><option value="puntual">Una vez</option></select></label></div><label>Fecha prevista (opcional)<input type="date" value={form.due_date} onChange={e => setForm({ ...form, due_date: e.target.value })} /></label><button className="button primary full" disabled={busy}>Guardar tarea</button></form></Modal>}
-    {reset && <Modal title={reset === 'diaria' ? '¿Reiniciar el día?' : '¿Reiniciar la semana?'} onClose={() => setReset(null)} busy={busy}><p>Se desmarcarán todas las tareas {reset === 'diaria' ? 'diarias' : 'semanales'} de Papá y del Hijo.</p><button className="button primary full" disabled={busy} onClick={async () => { if (await run(() => household.resetTasks(reset), 'Listos para empezar de nuevo')) setReset(null); }}>Reiniciar tareas</button></Modal>}
-    {deleting && <Modal title="¿Eliminar esta tarea?" onClose={() => setDeleting(null)} busy={busy}><p>{deleting.title}</p><button className="button danger full" disabled={busy} onClick={async () => { if (await run(() => household.remove('household_tasks', deleting.id), 'Tarea eliminada')) setDeleting(null); }}>Confirmar eliminación</button></Modal>}
+    <div className="page-heading">
+      <div><div className="eyebrow">CUIDAR LA CASA ES COSA DE DOS</div><h1>Nuestra semana,<br />en equipo.</h1><p>Cada día tiene su ritmo. Cada uno, su parte.</p></div>
+      <button className="button primary" onClick={addTask}><Plus size={19} />Nueva tarea</button>
+    </div>
+    <div className="family-context"><strong>Vuestra rutina, día a día.</strong><p>Elige un día para ver sus horarios, responsables y notas. Cada tarea vuelve a estar pendiente en su siguiente fecha.</p></div>
+    <div className="schedule-days" aria-label="Día de las tareas">
+      {DAYS.map((day, i) => <button key={day} className={selectedIndex === i ? 'active' : ''} aria-pressed={selectedIndex === i} aria-label={`Ver tareas del ${day}`} onClick={() => setChosenDay(i === dayIndex(today) ? null : i)}><span>{day.slice(0, 3)}</span><strong>{Number(shiftDate(week, i).slice(-2))}</strong>{i === dayIndex(today) && <small>HOY</small>}</button>)}
+    </div>
+    <div className="progress-card">
+      <div className="progress-copy"><span className="eyebrow">{isToday ? 'ASÍ VA EL DÍA' : `ASÍ VA EL ${DAYS[selectedIndex].toUpperCase()}`}</span><h2>{selected.length && completed === selected.length ? '¡Buen trabajo, equipo!' : 'Cada tarea cuenta.'}</h2><p>{completed} de {selected.length} tareas {isToday ? 'de hoy' : `del ${DAYS[selectedIndex].toLowerCase()}`} completadas</p></div>
+      <div className="progress-number">{progress}<span>%</span></div>
+      <div className="progress-track" role="progressbar" aria-label="Tareas del día seleccionado completadas" aria-valuenow={progress} aria-valuemin={0} aria-valuemax={100}><div style={{ width: `${progress}%` }} /></div>
+    </div>
+    <div className="tasks-toolbar"><div className="pills">{[['Todas', 'Todas'], ['Hijo', 'Mis tareas (Hijo)'], ['Padre', 'Tareas de Papá']].map(([key, text]) => <button key={key} className={`pill ${filter === key ? 'active' : ''}`} aria-pressed={filter === key} onClick={() => setFilter(key)}>{text}</button>)}</div><span className="muted small">Las tareas de «Ambos» aparecen en los dos perfiles. El completado se guarda por fecha.</span></div>
+    {Object.entries(PERIODS).map(([period, label]) => {
+      const group = selected.filter(t => (t.time_of_day || 'flexible') === period).sort((a, b) => (a.scheduled_time || '99').localeCompare(b.scheduled_time || '99') || a.id.localeCompare(b.id));
+      return group.length > 0 && <section className="routine-group" key={period} aria-label={label}><h2>{label}<span>{group.length}</span></h2><div className="task-list">{group.map(task => {
+        const done = taskCompletedOn(task, selectedDate);
+        return <article key={task.id} className={`task-card ${done ? 'completed' : ''}`}>
+          <button className="task-checkbox" role="checkbox" aria-checked={done} aria-label={`Completar ${task.title}`} disabled={busy} onClick={() => run(() => household.completeTask(task.id, selectedDate, !done))}>{done && <Check size={24} />}</button>
+          <div className="task-info"><h3>{task.title}</h3><div><span className={`assignee ${task.assigned_to === 'Hijo' ? 'son' : ''}`}>{task.assigned_to === 'Padre' ? 'Papá' : task.assigned_to}</span>{task.scheduled_time && <span><Clock size={13} />{task.scheduled_time.slice(0, 5)}</span>}<span>{task.frequency === 'puntual' ? 'Una vez' : scheduleLabel(task)}</span></div>{task.notes && <p className="task-notes">{task.notes}</p>}</div>
+          <button className="icon-button muted" disabled={busy} aria-label={`Eliminar ${task.title}`} onClick={() => setDeleting(task)}><Trash2 size={17} /></button>
+        </article>;
+      })}</div></section>;
+    })}
+    {!selected.length && <div className="empty-state"><Sparkles size={36} /><h3>Sin tareas para este día</h3><p>Prueba otro día o perfil, o añade una nueva tarea.</p></div>}
+    <div className="reset-panel"><div><h3>Empezamos de nuevo</h3><p>Las rutinas empiezan pendientes en cada nueva fecha. También puedes desmarcarlas manualmente.</p></div><div className="reset-buttons">
+      <button className="button secondary" disabled={busy || !periodHasCompletions(tasks, 'diaria', selectedDate)} onClick={() => setReset('diaria')}><RotateCcw size={16} />Reiniciar día</button>
+      <button className="button secondary" disabled={busy || !periodHasCompletions(tasks, 'semanal', selectedDate)} onClick={() => setReset('semanal')}><RotateCcw size={16} />Reiniciar semana</button>
+    </div></div>
+    {form && <Modal title="Una nueva tarea" onClose={() => setForm(null)} busy={busy}><form className="form-stack" onSubmit={save}>
+      <label>¿Qué hay que hacer?<input autoFocus value={form.title} required maxLength={200} placeholder="Por ejemplo, vaciar el lavavajillas" onChange={e => setForm({ ...form, title: e.target.value })} /></label>
+      <div className="form-row"><label>¿Quién se encarga?<select value={form.assigned_to} onChange={e => setForm({ ...form, assigned_to: e.target.value })}><option value="Padre">Papá</option><option>Hijo</option><option>Ambos</option></select></label><label>Frecuencia<select value={form.frequency} onChange={e => setForm({ ...form, frequency: e.target.value, scheduled_days: e.target.value === 'semanal' ? [selectedIndex] : [0, 1, 2, 3, 4, 5, 6] })}><option value="diaria">Rutina diaria</option><option value="semanal">Cada semana</option><option value="puntual">Una vez</option></select></label></div>
+      {form.frequency !== 'puntual' && <div><span className="field-label">Días de la semana</span><div className="pills schedule-form-days">{DAYS.map((day, i) => <button key={day} type="button" aria-label={day} aria-pressed={form.scheduled_days.includes(i)} className={`pill ${form.scheduled_days.includes(i) ? 'active' : ''}`} onClick={() => setForm({ ...form, scheduled_days: form.scheduled_days.includes(i) ? form.scheduled_days.filter(d => d !== i) : [...form.scheduled_days, i].sort() })}>{day.slice(0, 3)}</button>)}</div>{!form.scheduled_days.length && <p className="inline-error">Selecciona al menos un día.</p>}</div>}
+      <div className="form-row"><label>Momento del día<select value={form.time_of_day} onChange={e => setForm({ ...form, time_of_day: e.target.value })}>{Object.entries(PERIODS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select></label><label>Hora (opcional)<input type="time" value={form.scheduled_time} onChange={e => setForm({ ...form, scheduled_time: e.target.value })} /></label></div>
+      <label>{form.frequency === 'puntual' ? 'Fecha prevista' : 'Empezar a partir de (opcional)'}<input type="date" required={form.frequency === 'puntual'} value={form.due_date} onChange={e => setForm({ ...form, due_date: e.target.value })} /></label>
+      <label>Notas (opcional)<textarea rows={2} maxLength={2000} value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} /></label>
+      <button className="button primary full" disabled={busy || !form.scheduled_days.length}>Guardar tarea</button>
+    </form></Modal>}
+    {reset && <Modal title={reset === 'diaria' ? '¿Reiniciar este día?' : '¿Reiniciar esta semana?'} onClose={() => setReset(null)} busy={busy}><p>Se desmarcarán las tareas {reset === 'diaria' ? `diarias del ${selectedDate}` : `semanales del ${week} al ${shiftDate(week, 6)}`} de ambos perfiles. Los demás días y semanas conservarán su historial.</p><button className="button primary full" disabled={busy} onClick={async () => { if (await run(() => household.resetTasks(reset, selectedDate), 'Tareas reiniciadas')) setReset(null); }}>Reiniciar tareas</button></Modal>}
+    {deleting && <Modal title="¿Eliminar esta tarea?" onClose={() => setDeleting(null)} busy={busy}><p>{deleting.title}. Se retirará de todos los días de la rutina.</p><button className="button danger full" disabled={busy} onClick={async () => { if (await run(() => household.remove('household_tasks', deleting.id), 'Tarea eliminada')) setDeleting(null); }}>Confirmar eliminación</button></Modal>}
   </>;
 }
 ```
@@ -650,13 +784,14 @@ import { ChevronLeft, ChevronRight, Sun, Moon, Plus, ShoppingBasket, Check, Uten
 import Modal from './Modal.jsx';
 import { DAYS, monday, shiftDate, dateKey } from '../lib/domain.js';
 import { household } from '../services/householdService.js';
+import { menuForWeek } from '../lib/familySchedule.js';
 
-export default function MenuView({ meals, busy, run }) {
+export default function MenuView({ meals, templates = [], busy, run }) {
   const [week, setWeek] = useState(monday());
   const [meal, setMeal] = useState(null);
   const [added, setAdded] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  const current = meals.filter(m => m.week_start === week);
+  const current = menuForWeek(meals, week, templates);
   const formatted = iso => new Date(`${iso}T12:00:00`).toLocaleDateString('es', { day: 'numeric', month: 'short' });
   function edit(day, type) {
     setMeal(current.find(m => m.day_of_week === day && m.meal_type === type) || { week_start: week, day_of_week: day, meal_type: type, dish_name: '', notes: '', missing_ingredients: '' });
@@ -665,15 +800,16 @@ export default function MenuView({ meals, busy, run }) {
   async function save(e) {
     e.preventDefault();
     const { id, ...value } = meal;
-    value.dish_name = value.dish_name.trim();
+    value.dish_name = value.dish_name.trim(); value.is_skipped = false;
     if (!value.dish_name) return;
     if (await run(() => household.saveMeal(value), 'Menú guardado')) setMeal(null);
   }
   return <>
     <div className="page-heading"><div><div className="eyebrow">LA SEMANA SABE MEJOR CON UN PLAN</div><h1>¿Qué comemos hoy?</h1><p>Siete días, muchas ideas y una compra más fácil.</p></div><div className="menu-count"><Utensils size={18} /><strong>{current.length}/14</strong> platos planeados</div></div>
+    <div className="family-context"><strong>Vuestro menú habitual</strong><p>La plantilla compartida se repite cada semana. Las notas incluyen quién cocina y qué preparar; las ediciones solo afectan a la semana seleccionada.</p></div>
     <div className="week-toolbar"><button className="icon-button" aria-label="Semana anterior" onClick={() => setWeek(shiftDate(week, -7))}><ChevronLeft size={22} /></button><h2>{formatted(week)} — {formatted(shiftDate(week, 6))} <span>{week.slice(0, 4)}</span></h2><button className="icon-button" aria-label="Semana siguiente" onClick={() => setWeek(shiftDate(week, 7))}><ChevronRight size={22} /></button><button className="pill" onClick={() => setWeek(monday())}>Esta semana</button></div>
     <div className="menu-calendar">{DAYS.map((day, i) => <section key={day} className={`day-card ${shiftDate(week, i) === dateKey() ? 'today' : ''}`}><header><h3>{day}</h3><span>{shiftDate(week, i) === dateKey() ? 'HOY' : formatted(shiftDate(week, i))}</span></header><div className="day-meals">{['comida', 'cena'].map(type => { const item = current.find(m => m.day_of_week === day && m.meal_type === type); const Icon = type === 'comida' ? Sun : Moon; return <button key={type} className={`meal-slot ${item ? 'filled' : ''}`} onClick={() => edit(day, type)} aria-label={`${item ? 'Editar' : 'Añadir'} ${type} del ${day}`}><span className="meal-label"><Icon size={16} />{type === 'comida' ? 'COMIDA' : 'CENA'}</span>{item ? <><strong>{item.dish_name}</strong>{item.notes && <p>{item.notes}</p>}{item.missing_ingredients && <span className="missing-label"><ShoppingBasket size={13} />{item.missing_ingredients}</span>}</> : <span className="meal-placeholder"><Plus size={19} />Añadir plato</span>}</button>; })}</div></section>)}</div>
-    <p className="menu-note"><span>✦</span> Planificar un poco hoy es disfrutar más de la semana.</p>
+    <p className="menu-note"><span>✦</span>Ingredientes básicos orientativos: ajustadlos a vuestras recetas y existencias.</p>
     {meal && <Modal title={`${meal.day_of_week} · ${meal.meal_type === 'comida' ? 'Comida' : 'Cena'}`} onClose={() => setMeal(null)} busy={busy}><form className="form-stack" onSubmit={save}>
       <label>¿Qué vamos a preparar?<input autoFocus required maxLength={200} placeholder="Por ejemplo, pasta con verduras" value={meal.dish_name} onChange={e => setMeal({ ...meal, dish_name: e.target.value })} /></label>
       <label>Notas (opcional)<textarea rows={3} maxLength={2000} placeholder="La receta, una idea o algo que recordar…" value={meal.notes} onChange={e => setMeal({ ...meal, notes: e.target.value })} /></label>
@@ -685,10 +821,11 @@ export default function MenuView({ meals, busy, run }) {
         if (ok) setAdded(true);
       }}>{added ? <Check size={17} /> : <ShoppingBasket size={17} />}{added ? 'Añadidos a la compra' : 'Añadir ingredientes a la compra'}</button>
       <button className="button primary full" disabled={busy}>Guardar plato</button>
-      {meal.id && <button type="button" className="button danger" disabled={busy} onClick={async () => {
+      {meal.dish_name && <button type="button" className="button danger" disabled={busy} onClick={async () => {
         if (!deleting) return setDeleting(true);
-        if (await run(() => household.remove('weekly_menu', meal.id), 'Plato eliminado')) setMeal(null);
-      }}><Trash2 size={16} />{deleting ? 'Confirmar eliminación' : 'Eliminar plato'}</button>}
+        const { id, ...value } = meal;
+        if (await run(() => household.saveMeal({ ...value, is_skipped: true }), 'Plato retirado de esta semana')) setMeal(null);
+      }}><Trash2 size={16} />{deleting ? 'Confirmar: quitar de esta semana' : 'Quitar plato de esta semana'}</button>}
     </form></Modal>}
   </>;
 }
@@ -1032,6 +1169,20 @@ main { max-width: 1340px; padding: 30px 44px 35px; margin: auto; }
 .quantity-stepper button { min-width: 44px; }.quantity-stepper output { min-width: 22px; }
 .product-bottom { flex-wrap: wrap; gap: 8px; }.quantity-stepper { margin-left: auto; }
 @media (max-width: 520px) { .pantry-illustration { transform: scale(.48); right: 4px; } }
+
+.family-context { background: #eef2e7; border: 1px solid #dfe6d4; border-radius: 10px; padding: 16px 19px; margin-bottom: 20px; font-size: 12px; color: #4f6545; }
+.family-context p { font-size: 11px; color: #65745d; line-height: 1.75; margin-top: 6px; }
+.schedule-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; margin: 20px 0; }
+.schedule-days button { min-height: 78px; border: 1px solid #dce3d2; background: #fffefa; border-radius: 9px; color: #68785b; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; }
+.schedule-days button.active { background: #32634c; color: white; border-color: #32634c; }
+.schedule-days span { font-size: 11px; }.schedule-days strong { font-size: 20px; font-weight: 600; }.schedule-days small { font-size: 8px; letter-spacing: 1px; }
+.routine-group { margin: 28px 0; }.routine-group > h2 { font-family: Georgia, serif; font-size: 23px; font-weight: 400; display: flex; gap: 10px; align-items: center; margin-bottom: 13px; }
+.routine-group > h2 span { font-family: system-ui, sans-serif; font-size: 11px; background: #e7eddd; color: #647657; border-radius: 5px; padding: 3px 8px; }
+.task-info .task-notes { font-size: 11px; color: #65745d; line-height: 1.7; margin-top: 9px; }
+.schedule-form-days { margin-top: 9px; }
+.meal-slot .missing-label { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.7; }
+.meal-slot .missing-label svg { display: inline; vertical-align: middle; margin-right: 4px; }
+@media (max-width: 520px) { .schedule-days { gap: 4px; }.schedule-days button { min-height: 75px; }.schedule-days span { font-size: 10px; }.family-context { padding: 14px; }.task-card { align-items: flex-start; }.task-info .task-notes { font-size: 10px; }.schedule-form-days { gap: 4px; }.schedule-form-days .pill { padding: 6px 8px; } }
 ```
 
 ### `vite.config.js`
@@ -1154,6 +1305,73 @@ if (!env.VITE_SUPABASE_URL || !env.VITE_SUPABASE_ANON_KEY) {
 ```
 
 Los iconos PNG, `.nojekyll`, el lockfile y las pruebas están incluidos en el repositorio.
+
+
+### `src/lib/familySchedule.js`
+
+```javascript
+import { dateKey, DAYS, monday, shiftDate } from './domain.js';
+
+export const PERIODS = { manana: 'Por la mañana', mediodia: 'Comidas y mediodía', tarde: 'Por la tarde', noche: 'Cenas y noche', flexible: 'Sin hora fija' };
+export const dayIndex = date => (new Date(`${date}T12:00:00`).getDay() + 6) % 7;
+export function taskOccursOn(task, date = dateKey()) {
+  if (task.frequency === 'puntual') return !task.due_date || task.due_date === date;
+  return (!task.due_date || task.due_date <= date) && (task.scheduled_days || [0, 1, 2, 3, 4, 5, 6]).includes(dayIndex(date));
+}
+export function taskCompletedOn(task, date) {
+  if (Array.isArray(task.completed_dates)) return task.completed_dates.includes(date);
+  return Boolean(task.is_completed);
+}
+export function periodHasCompletions(tasks, frequency, date) {
+  const first = frequency === 'semanal' ? monday(new Date(`${date}T12:00:00`)) : date;
+  const last = frequency === 'semanal' ? shiftDate(first, 6) : date;
+  return tasks.some(t => t.frequency === frequency && (t.completed_dates || []).some(d => d >= first && d <= last));
+}
+export function scheduleLabel(task) {
+  const days = task.scheduled_days || [0, 1, 2, 3, 4, 5, 6];
+  return days.length === 7 ? 'Todos los días' : days.map(i => DAYS[i].slice(0, 3)).join(' · ');
+}
+export function menuForWeek(meals, week, templates = []) {
+  const slots = new Map(templates.map(({ id, ...base }) => [`${base.day_of_week}:${base.meal_type}`, { ...base, week_start: week }]));
+  for (const stored of meals.filter(m => m.week_start === week)) slots.set(`${stored.day_of_week}:${stored.meal_type}`, stored);
+  return [...slots.values()].filter(meal => !meal.is_skipped);
+}
+```
+
+### `scripts/seed-family.mjs`
+
+```javascript
+import assert from 'node:assert/strict';
+import { loadEnv } from 'vite';
+import { createClient } from '@supabase/supabase-js';
+import { readFileSync } from 'node:fs';
+import { monday, normalize } from '../src/lib/domain.js';
+
+const env = loadEnv('production', process.cwd(), '');
+assert.ok(env.VITE_SUPABASE_URL && env.VITE_SUPABASE_ANON_KEY, 'Falta configurar Supabase');
+const db = createClient(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+// Datos familiares locales: este archivo NO se incluye en Git ni en el bundle.
+const { tasks: FAMILY_TASKS, menu: FIXED_MENU, products: BASIC_PRODUCTS } = JSON.parse(readFileSync(new URL('../.family-plan.local.json', import.meta.url), 'utf8'));
+async function query(request) {
+  const { data, error } = await request;
+  if (error) throw new Error(error.message);
+  return data;
+}
+// Comprobar primero la migración, sin empezar una carga parcial por falta de columnas.
+await query(db.from('household_tasks').select('id,scheduled_days,completed_dates').limit(1));
+await query(db.from('weekly_menu').select('id,is_skipped').limit(1));
+await query(db.from('menu_templates').select('id').limit(1));
+const inventory = await query(db.from('inventory_items').select('id,name'));
+const present = new Set(inventory.map(item => normalize(item.name)));
+const additions = BASIC_PRODUCTS.filter(item => !present.has(normalize(item.name)));
+// Los UUID estables y ON CONFLICT DO NOTHING preservan las modificaciones del hogar.
+const insertedTasks = await query(db.from('household_tasks').upsert(FAMILY_TASKS, { onConflict: 'id', ignoreDuplicates: true }).select('id'));
+const insertedItems = additions.length ? await query(db.from('inventory_items').upsert(additions, { onConflict: 'id', ignoreDuplicates: true }).select('id')) : [];
+const week = monday();
+const insertedMeals = await query(db.from('weekly_menu').upsert(FIXED_MENU.map(meal => ({ ...meal, week_start: week })), { onConflict: 'week_start,day_of_week,meal_type', ignoreDuplicates: true }).select('id'));
+const insertedTemplates = await query(db.from('menu_templates').upsert(FIXED_MENU.map(({ is_skipped, ...meal }) => meal), { onConflict: 'day_of_week,meal_type', ignoreDuplicates: true }).select('id'));
+console.log(JSON.stringify({ week, insertedTasks: insertedTasks.length, insertedProducts: insertedItems.length, insertedMeals: insertedMeals.length, insertedTemplates: insertedTemplates.length }));
+```
 
 ## 10. Guía breve de 5 pasos para subirlo a GitHub Pages con gh-pages y conectar las variables de entorno
 

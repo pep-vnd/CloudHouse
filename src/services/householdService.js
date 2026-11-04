@@ -1,14 +1,14 @@
 import { supabase, unwrap, configurationError } from './supabaseClient.js';
-import { nextQuantity } from '../lib/domain.js';
+import { nextQuantity, dateKey, monday, shiftDate } from '../lib/domain.js';
 
-const TABLES = ['inventory_items', 'household_tasks', 'weekly_menu'];
+const TABLES = ['inventory_items', 'household_tasks', 'weekly_menu', 'menu_templates'];
 const LOCAL_KEY = 'cloudhouse.local.v1';
 const CACHE_KEY = 'cloudhouse.cloud-cache.v1';
 const empty = () => Object.fromEntries(TABLES.map(t => [t, []]));
 function read(key) {
   try {
     const value = JSON.parse(localStorage.getItem(key));
-    return value && TABLES.every(t => Array.isArray(value[t])) ? value : empty();
+    return value && Array.isArray(value.inventory_items) && TABLES.every(t => value[t] === undefined || Array.isArray(value[t])) ? { ...empty(), ...value } : empty();
   } catch { return empty(); }
 }
 export function cachedHousehold() { return read(supabase ? CACHE_KEY : LOCAL_KEY); }
@@ -118,10 +118,26 @@ export const household = {
     if (supabase) return unwrap(supabase.from('household_tasks').insert(task));
     return localWrite(data => data.household_tasks.push({ ...task, id: crypto.randomUUID(), is_completed: false }));
   },
-  async resetTasks(frequency) {
+  async completeTask(id, date, completed) {
     ensureOnline();
-    if (supabase) return unwrap(supabase.from('household_tasks').update({ is_completed: false }).eq('frequency', frequency));
-    return localWrite(data => data.household_tasks.filter(t => t.frequency === frequency).forEach(t => { t.is_completed = false; }));
+    if (supabase) return unwrap(supabase.rpc('set_task_completion', { p_id: id, p_date: date, p_completed: completed }));
+    return localWrite(data => {
+      const task = data.household_tasks.find(t => t.id === id);
+      if (!task) throw new Error('La tarea ya no existe');
+      const dates = new Set(task.completed_dates || []);
+      if (completed) dates.add(date); else dates.delete(date);
+      task.completed_dates = [...dates]; task.is_completed = completed;
+    });
+  },
+  async resetTasks(frequency, date = dateKey()) {
+    ensureOnline();
+    if (supabase) return unwrap(supabase.rpc('reset_task_period', { p_frequency: frequency, p_date: date }));
+    const first = frequency === 'semanal' ? monday(new Date(`${date}T12:00:00`)) : date;
+    const last = frequency === 'semanal' ? shiftDate(first, 6) : date;
+    return localWrite(data => data.household_tasks.filter(t => t.frequency === frequency).forEach(t => {
+      t.completed_dates = (t.completed_dates || []).filter(d => d < first || d > last);
+      t.is_completed = false;
+    }));
   },
   async saveMeal(meal) {
     ensureOnline();

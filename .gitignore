@@ -10,3 +10,4 @@ dist/
 contraseñas.txt
 *password*.txt
 *secret*.txt
+.family-plan.local.json

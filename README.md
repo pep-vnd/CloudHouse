@@ -71,8 +71,9 @@ anónimo, actualizaciones concurrentes, reposición, duplicados y Realtime.
   mínimo y elimina el producto de la lista. Los botones + añaden una unidad.
 - El filtro de ubicación, categoría, nombre y sin gluten se combina.
 - Los menús tienen `week_start` para conservar semanas diferentes.
-- El progreso diario incluye tareas sin fecha, de hoy y vencidas; excluye futuras.
-  El reinicio diario/semanal es explícito y afecta a ambos perfiles.
+- Las tareas se organizan por día y franja horaria. El completado se guarda por
+  fecha, así que una rutina vuelve a estar pendiente en su siguiente aparición.
+  El reinicio manual afecta al día o semana seleccionados, conservando el resto del historial.
 - La PWA almacena su interfaz y la última copia de datos. Sin conexión puedes
   consultar; las escrituras a Supabase requieren conexión y muestran un error
   si no se pueden guardar. No se confirman escrituras que no han llegado al servidor.
@@ -85,8 +86,8 @@ anónimo, actualizaciones concurrentes, reposición, duplicados y Realtime.
 
 ## Acceso y datos
 
-El SQL implementa las **políticas RLS abiertas solicitadas** para estas tres
-tablas. Cualquiera que obtenga la URL y la clave pública puede leer y modificar
+El SQL implementa las **políticas RLS abiertas solicitadas** para las tablas
+del hogar. Cualquiera que obtenga la URL y la clave pública puede leer y modificar
 el hogar. GitHub Pages es público. El selector Papá/Hijo no autentica y un PIN
 solo en el frontend tampoco protegería la base de datos. Usa este despliegue
 para los datos domésticos no sensibles previstos; para acceso privado real,
@@ -94,6 +95,22 @@ añade Supabase Auth y políticas vinculadas a un hogar antes de ampliar el uso.
 
 No se incluye la contraseña de PostgreSQL ni ninguna clave administrativa
 en el repositorio. `.env.local` está excluido de Git.
+
+## Organización familiar precargada
+
+Los horarios, las rutinas, los ingredientes y los platos se guardan en Supabase.
+El repositorio contiene la interfaz y los esquemas, sin los datos del hogar.
+La tabla `menu_templates` contiene el menú habitual compartido; `weekly_menu`
+guarda las ediciones de cada semana. Las tareas tienen días, franjas y un
+historial de fechas completadas independiente para cada aparición.
+
+La precarga se hace con `node scripts/seed-family.mjs`. Lee exclusivamente el
+archivo local `.family-plan.local.json`, excluido de Git, con tres arrays:
+`tasks`, `menu` y `products`. Los UUID estables y los conflictos ignorados
+permiten repetirla sin sobrescribir ediciones ni cantidades. La aplicación
+no vuelve a crear automáticamente las tareas o productos eliminados.
+`node scripts/verify-family.mjs` comprueba los datos frente al archivo local y
+verifica el completado concurrente usando una tarea temporal.
 
 ## Referencias
 

@@ -84,7 +84,7 @@ export default function App() {
         {loading ? <div className="empty-state"><RefreshCw className="spin" /><p>Preparando tu hogar…</p></div> : <fieldset className="view-fieldset">
           {(tab === 'inventory' || tab === 'shopping') && <InventoryView items={data.inventory_items} shopping={tab === 'shopping'} onTab={changeTab} onAdd={() => setProduct({})} onEdit={setProduct} onScan={() => setScanner(true)} busy={busy} run={run} />}
           {tab === 'tasks' && <TasksView tasks={data.household_tasks} profile={profile || 'Hijo'} busy={busy} run={run} />}
-          {tab === 'menu' && <MenuView meals={data.weekly_menu} busy={busy} run={run} />}
+          {tab === 'menu' && <MenuView meals={data.weekly_menu} templates={data.menu_templates} busy={busy} run={run} />}
         </fieldset>}
         <footer className="main-footer"><Heart size={13} />Menos pendientes. Más hogar.<button onClick={() => setSettings(true)}><Cloud size={14} />{stateText}</button></footer>
       </main>
