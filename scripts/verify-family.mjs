@@ -1,3 +1,4 @@
+import { authenticateClients } from './authenticate.mjs';
 import assert from 'node:assert/strict';
 import { loadEnv } from 'vite';
 import { createClient } from '@supabase/supabase-js';
@@ -6,6 +7,7 @@ import { monday } from '../src/lib/domain.js';
 
 const env = loadEnv('production', process.cwd(), '');
 const db = createClient(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+await authenticateClients([db]);
 const { tasks: FAMILY_TASKS, menu: FIXED_MENU, products: BASIC_PRODUCTS } = JSON.parse(readFileSync(new URL('../.family-plan.local.json', import.meta.url), 'utf8'));
 async function query(q) { const { data, error } = await q; if (error) throw new Error(error.message); return data; }
 const tasks = await query(db.from('household_tasks').select('*').in('id', FAMILY_TASKS.map(t => t.id)));

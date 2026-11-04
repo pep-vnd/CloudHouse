@@ -15,10 +15,9 @@ El proyecto entregado ya está inicializado: usa `npm ci` para reproducir las ve
 ### `supabase/schema.sql`
 
 ```sql
--- CloudHouse: ejecutar una vez en SQL Editor de un proyecto Supabase gratuito.
--- Acceso compartido abierto solicitado: cualquiera con URL y anon key puede
--- leer y modificar estas tres tablas. El selector de perfil no es autenticación.
 begin;
+-- CloudHouse: ejecutar una vez en SQL Editor de un proyecto Supabase gratuito.
+-- Ejecutar íntegro: la migración final restringe el acceso a los miembros.
 create extension if not exists pgcrypto;
 
 create table if not exists public.inventory_items (
@@ -155,10 +154,8 @@ begin
     end if;
   end loop;
 end $$;
-commit;
 
 -- Horarios y organización familiar (migración 20261104).
-begin;
 alter table public.household_tasks
   add column if not exists scheduled_days smallint[] not null default '{0,1,2,3,4,5,6}',
   add column if not exists time_of_day text not null default 'flexible',
@@ -205,10 +202,8 @@ end;
 $$;
 revoke all on function public.set_task_completion(uuid,date,boolean), public.reset_task_period(text,date) from public;
 grant execute on function public.set_task_completion(uuid,date,boolean), public.reset_task_period(text,date) to anon, authenticated;
-commit;
 
 -- Plantillas de menú compartidas, sin datos personales en el código.
-begin;
 create table if not exists public.menu_templates (
   id uuid primary key default gen_random_uuid(),
   day_of_week text not null check (day_of_week in ('Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo')),
@@ -232,6 +227,38 @@ insert into public.menu_templates (day_of_week,meal_type,dish_name,notes,missing
 select day_of_week,meal_type,dish_name,notes,missing_ingredients from public.weekly_menu
 where week_start = (select min(week_start) from public.weekly_menu) and not is_skipped
 on conflict (day_of_week,meal_type) do nothing;
+
+-- Acceso exclusivo para miembros provisionados por el administrador.
+-- No contiene usuarios, contraseñas ni datos personales.
+create table if not exists public.household_members (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  username text not null unique check (length(username) between 1 and 40),
+  profile text not null check (profile in ('Padre','Hijo'))
+);
+alter table public.household_members enable row level security;
+revoke all on public.household_members from public, anon, authenticated;
+grant select on public.household_members to authenticated;
+drop policy if exists own_membership on public.household_members;
+create policy own_membership on public.household_members for select to authenticated
+  using (user_id = (select auth.uid()));
+
+do $$
+declare t text; p record;
+begin
+  foreach t in array array['inventory_items','household_tasks','weekly_menu','menu_templates'] loop
+    execute format('alter table public.%I enable row level security', t);
+    -- Retira todas las políticas anteriores, incluidas las abiertas.
+    for p in select policyname from pg_policies where schemaname = 'public' and tablename = t loop
+      execute format('drop policy %I on public.%I', p.policyname, t);
+    end loop;
+    execute format('revoke all on public.%I from public, anon, authenticated', t);
+    execute format('grant select, insert, update, delete on public.%I to authenticated', t);
+    execute format('create policy family_members_only on public.%I for all to authenticated using (exists (select 1 from public.household_members where user_id = (select auth.uid()))) with check (exists (select 1 from public.household_members where user_id = (select auth.uid())))', t);
+  end loop;
+end $$;
+
+revoke all on function public.adjust_inventory(uuid,integer), public.add_inventory(jsonb), public.buy_inventory(uuid), public.add_ingredient(text), public.set_task_completion(uuid,date,boolean), public.reset_task_period(text,date) from public, anon, authenticated;
+grant execute on function public.adjust_inventory(uuid,integer), public.add_inventory(jsonb), public.buy_inventory(uuid), public.add_ingredient(text), public.set_task_completion(uuid,date,boolean), public.reset_task_period(text,date) to authenticated;
 commit;
 ```
 
@@ -248,7 +275,7 @@ export const isCloudConfigured = Boolean(url && key);
 export const configurationError = Boolean(url) !== Boolean(key)
   ? 'Falta la URL o la clave pública de Supabase. Completa ambas variables y vuelve a desplegar.' : null;
 export const supabase = isCloudConfigured ? createClient(url, key, {
-  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
   realtime: { params: { eventsPerSecond: 10 } },
 }) : null;
 
@@ -318,7 +345,12 @@ function read(key) {
     return value && Array.isArray(value.inventory_items) && TABLES.every(t => value[t] === undefined || Array.isArray(value[t])) ? { ...empty(), ...value } : empty();
   } catch { return empty(); }
 }
-export function cachedHousehold() { return read(supabase ? CACHE_KEY : LOCAL_KEY); }
+export function cachedHousehold() {
+  if (!supabase) return read(LOCAL_KEY);
+  // Retira la copia anterior, creada antes de incorporar el acceso privado.
+  try { localStorage.removeItem(CACHE_KEY); localStorage.removeItem('cloudhouse.profile'); } catch {}
+  return empty();
+}
 export async function loadHousehold() {
   if (configurationError) throw new Error(configurationError);
   if (!supabase) return read(LOCAL_KEY);
@@ -331,7 +363,6 @@ export async function loadHousehold() {
     }
     return [t, rows];
   })));
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify(result)); } catch { /* La nube sigue siendo la fuente de datos. */ }
   return result;
 }
 async function localWrite(action) {
@@ -483,6 +514,7 @@ import MenuView from './components/MenuView.jsx';
 import ScannerModal from './components/ScannerModal.jsx';
 import ProductModal from './components/ProductModal.jsx';
 import Modal from './components/Modal.jsx';
+import AuthGate from './components/AuthGate.jsx';
 import { cachedHousehold, household, loadHousehold, subscribeHousehold } from './services/householdService.js';
 import { isCloudConfigured } from './services/supabaseClient.js';
 import { lookupBarcode } from './services/barcodeService.js';
@@ -491,8 +523,12 @@ const NAV = [{ key: 'inventory', title: 'Inventario', Icon: Archive }, { key: 's
 function savedProfile() { try { const value = localStorage.getItem('cloudhouse.profile'); return ['Padre', 'Hijo'].includes(value) ? value : null; } catch { return null; } }
 
 export default function App() {
-  const [profile, setProfile] = useState(savedProfile);
-  const [profileOpen, setProfileOpen] = useState(!profile);
+  return isCloudConfigured ? <AuthGate>{(account, logout) => <HouseholdApp key={account.user_id} account={account} onLogout={logout} />}</AuthGate> : <HouseholdApp />;
+}
+
+function HouseholdApp({ account, onLogout }) {
+  const [profile, setProfile] = useState(() => account?.profile || savedProfile());
+  const [profileOpen, setProfileOpen] = useState(!account && !profile);
   const [tab, setTab] = useState('inventory');
   const [data, setData] = useState(cachedHousehold);
   const [loading, setLoading] = useState(true);
@@ -550,7 +586,7 @@ export default function App() {
   const nav = mobile => NAV.map(({ key, title, Icon, mobile: short }) => <button key={key} className={tab === key ? 'nav-item active' : 'nav-item'} aria-current={tab === key ? 'page' : undefined} onClick={() => changeTab(key)}><Icon size={mobile ? 23 : 20} /><span>{mobile ? short || title : title}</span>{key === 'shopping' && count > 0 && <b>{count}</b>}</button>);
   return <div className="app-shell">
     <aside className="sidebar"><a href={import.meta.env.BASE_URL} className="brand"><span className="brand-icon"><House size={23} /></span>CloudHouse<span className="brand-dot">.</span></a><div className="home-label"><span className="status-dot" />NUESTRO HOGAR</div><nav aria-label="Navegación principal">{nav(false)}</nav><div className="sidebar-bottom"><div className="team-card"><Leaf size={24} strokeWidth={1.5} /><h3>La casa, en equipo.</h3><p>Pequeños hábitos.<br />Un hogar más feliz.</p><div className="team-avatars"><span>P</span><span>H</span><small>Papá & Hijo</small></div></div><button className="connection-button" onClick={() => setSettings(true)}><span className={`status-dot ${isCloudConfigured && online && realtime === 'SUBSCRIBED' ? '' : 'amber-dot'}`} />{stateText}<ArrowUpRight size={14} /></button></div></aside>
-    <div className="main-shell"><header className="topbar"><div className="breadcrumb"><House size={16} /><span>Nuestro hogar</span><span>/</span><strong>{NAV.find(n => n.key === tab).title}</strong></div><a href={import.meta.env.BASE_URL} className="brand mobile-brand"><span className="brand-icon"><House size={21} /></span>CloudHouse.</a><div className="topbar-right"><span className="today-date">{new Date().toLocaleDateString('es', { weekday: 'long', day: 'numeric', month: 'long' })}</span><button className="profile-button" onClick={() => setProfileOpen(true)} aria-label="Cambiar perfil"><span>{profile === 'Padre' ? 'P' : 'H'}</span><span>{profile === 'Padre' ? 'Papá' : 'Hijo'}</span></button></div></header>
+    <div className="main-shell"><header className="topbar"><div className="breadcrumb"><House size={16} /><span>Nuestro hogar</span><span>/</span><strong>{NAV.find(n => n.key === tab).title}</strong></div><a href={import.meta.env.BASE_URL} className="brand mobile-brand"><span className="brand-icon"><House size={21} /></span>CloudHouse.</a><div className="topbar-right"><span className="today-date">{new Date().toLocaleDateString('es', { weekday: 'long', day: 'numeric', month: 'long' })}</span><button className="profile-button" onClick={() => account ? setSettings(true) : setProfileOpen(true)} aria-label={account ? "Mi cuenta" : "Cambiar perfil"}><span>{profile === 'Padre' ? 'P' : 'H'}</span><span>{profile === 'Padre' ? 'Papá' : 'Hijo'}</span></button></div></header>
       <main><div className="greeting">Hola, {profile === 'Padre' ? 'Papá' : 'Hijo'} <span>☀</span><span className="greeting-note">Qué bien tenerte en casa.</span></div>
         {!isCloudConfigured && <div className="local-banner"><Info size={17} /><span>Modo local: tus datos se guardan en este navegador. La sincronización familiar está pendiente de conectar.</span><button onClick={() => setSettings(true)}>Ver detalles</button></div>}
         {!online && <div className="notice"><WifiOff size={18} />{isCloudConfigured ? 'Sin conexión. Estás viendo los últimos datos guardados.' : 'Sin conexión. Puedes seguir usando el modo local.'}</div>}
@@ -567,10 +603,10 @@ export default function App() {
     <nav className="bottom-nav" aria-label="Navegación móvil">{nav(true)}</nav>
     {toast && <div className="toast" role="status"><CircleCheck size={18} />{toast}</div>}
     {error && createPortal(<div className="error-toast" role="alert"><div><strong>No se ha completado la operación</strong><p>{error}</p></div><button className="icon-button" aria-label="Cerrar error" onClick={() => setError('')}><X size={20} /></button></div>, document.querySelector('dialog[open]') || document.body)}
-    {profileOpen && <Modal title="Bienvenido a casa" onClose={() => setProfileOpen(false)}><p className="muted">Elige tu perfil. Lo recordaremos en este dispositivo.</p><div className="profile-options"><button onClick={() => choose('Padre')}><span className="avatar-large dad"><UserRound size={33} /></span><strong>Soy Papá</strong><span>Juntos, todo es más fácil.</span></button><button onClick={() => choose('Hijo')}><span className="avatar-large son"><UserRound size={33} /></span><strong>Soy Hijo</strong><span>Yo también pongo mi parte.</span></button></div><p className="small muted">Puedes cambiar de perfil cuando quieras desde la esquina superior.</p></Modal>}
+    {!account && profileOpen && <Modal title="Bienvenido a casa" onClose={() => setProfileOpen(false)}><p className="muted">Elige tu perfil. Lo recordaremos en este dispositivo.</p><div className="profile-options"><button onClick={() => choose('Padre')}><span className="avatar-large dad"><UserRound size={33} /></span><strong>Soy Papá</strong><span>Juntos, todo es más fácil.</span></button><button onClick={() => choose('Hijo')}><span className="avatar-large son"><UserRound size={33} /></span><strong>Soy Hijo</strong><span>Yo también pongo mi parte.</span></button></div><p className="small muted">Puedes cambiar de perfil cuando quieras desde la esquina superior.</p></Modal>}
     {scanner && <ScannerModal onClose={() => setScanner(false)} onDetected={detected} busy={busy} />}
     {product && <ProductModal product={product} shopping={tab === 'shopping'} onClose={() => setProduct(null)} busy={busy} run={run} />}
-    {settings && <Modal title="Tu hogar, siempre a mano" onClose={() => setSettings(false)}><div className="form-stack"><div className="settings-status"><Cloud size={24} /><div><strong>{stateText}</strong><p>{isCloudConfigured ? 'Los cambios se comparten entre Papá e Hijo a través de Supabase.' : 'Este dispositivo funciona de forma independiente. Para compartir el hogar, conecta Supabase y vuelve a publicar la app.'}</p></div></div><h3>Instalar CloudHouse</h3><p className="muted">En iPhone: abre en Safari, pulsa Compartir y «Añadir a la pantalla de inicio». En Android: abre el menú de Chrome y pulsa «Instalar aplicación».</p>{install && <button className="button primary" onClick={async () => { await install.prompt(); await install.userChoice; setInstall(null); }}><Download size={18} />Instalar aplicación</button>}<button className="button secondary" onClick={() => { setSettings(false); setProfileOpen(true); }}>Cambiar perfil</button><p className="small muted">El perfil identifica a quién le toca cada tarea; no es una contraseña. No guardes datos sensibles en este hogar compartido.</p><a className="small" href="https://world.openfoodfacts.org" target="_blank" rel="noreferrer">Productos: Open Food Facts · ODbL · Fotos CC BY-SA</a></div></Modal>}
+    {settings && <Modal title="Tu hogar, siempre a mano" onClose={() => setSettings(false)}><div className="form-stack"><div className="settings-status"><Cloud size={24} /><div><strong>{stateText}</strong><p>{isCloudConfigured ? 'Los cambios se comparten entre Papá e Hijo a través de Supabase.' : 'Este dispositivo funciona de forma independiente. Para compartir el hogar, conecta Supabase y vuelve a publicar la app.'}</p></div></div><h3>Instalar CloudHouse</h3><p className="muted">En iPhone: abre en Safari, pulsa Compartir y «Añadir a la pantalla de inicio». En Android: abre el menú de Chrome y pulsa «Instalar aplicación».</p>{install && <button className="button primary" onClick={async () => { await install.prompt(); await install.userChoice; setInstall(null); }}><Download size={18} />Instalar aplicación</button>}<p className="small muted">{account ? `Sesión de ${account.username} · ${account.profile}. Solo las cuentas autorizadas pueden acceder al hogar.` : "El modo local guarda los datos solo en este navegador."}</p>{account ? <button className="button secondary" onClick={onLogout}>Cerrar sesión</button> : <button className="button secondary" onClick={() => { setSettings(false); setProfileOpen(true); }}>Cambiar perfil</button>}<a className="small" href="https://world.openfoodfacts.org" target="_blank" rel="noreferrer">Productos: Open Food Facts · ODbL · Fotos CC BY-SA</a></div></Modal>}
   </div>;
 }
 ```
@@ -1183,6 +1219,21 @@ main { max-width: 1340px; padding: 30px 44px 35px; margin: auto; }
 .meal-slot .missing-label { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.7; }
 .meal-slot .missing-label svg { display: inline; vertical-align: middle; margin-right: 4px; }
 @media (max-width: 520px) { .schedule-days { gap: 4px; }.schedule-days button { min-height: 75px; }.schedule-days span { font-size: 10px; }.family-context { padding: 14px; }.task-card { align-items: flex-start; }.task-info .task-notes { font-size: 10px; }.schedule-form-days { gap: 4px; }.schedule-form-days .pill { padding: 6px 8px; } }
+
+/* Entrada al hogar */
+.auth-page { min-height: 100dvh; display: grid; place-items: center; padding: 28px 20px; background: #f4f6f1; }
+.auth-card { width: min(100%, 440px); padding: 38px 32px; border: 1px solid #e0e6dc; border-radius: 28px; background: #fff; box-shadow: 0 18px 60px #2143310a; }
+.auth-card .brand { margin-bottom: 38px; }
+.auth-lock { width: 60px; height: 60px; display: grid; place-items: center; border-radius: 20px; color: #32634c; background: #edf3e9; margin-bottom: 22px; }
+.auth-card h1 { font-family: Georgia, serif; font-size: clamp(30px, 7vw, 39px); line-height: 1.15; margin: 10px 0 14px; }
+.auth-card .form-stack { margin-top: 30px; }
+.auth-card label { display: grid; gap: 9px; font-size: 14px; font-weight: 600; }
+.auth-card input { width: 100%; min-height: 50px; border: 1px solid #d4ddd2; border-radius: 12px; padding: 12px 14px; background: #fff; font-size: 16px; }
+.auth-card .button { min-height: 50px; width: 100%; justify-content: center; }
+.auth-error { color: #a33927; background: #fff2ee; padding: 12px; border-radius: 10px; margin-top: 18px; }
+.auth-footnote { margin-top: 24px; text-align: center; }
+.auth-checking { display: flex; align-items: center; gap: 10px; margin: 28px 0; }
+@media (max-width: 480px) { .auth-card { padding: 28px 22px; } }
 ```
 
 ### `vite.config.js`
@@ -1341,6 +1392,7 @@ export function menuForWeek(meals, week, templates = []) {
 ### `scripts/seed-family.mjs`
 
 ```javascript
+import { authenticateClients } from './authenticate.mjs';
 import assert from 'node:assert/strict';
 import { loadEnv } from 'vite';
 import { createClient } from '@supabase/supabase-js';
@@ -1350,6 +1402,7 @@ import { monday, normalize } from '../src/lib/domain.js';
 const env = loadEnv('production', process.cwd(), '');
 assert.ok(env.VITE_SUPABASE_URL && env.VITE_SUPABASE_ANON_KEY, 'Falta configurar Supabase');
 const db = createClient(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+await authenticateClients([db]);
 // Datos familiares locales: este archivo NO se incluye en Git ni en el bundle.
 const { tasks: FAMILY_TASKS, menu: FIXED_MENU, products: BASIC_PRODUCTS } = JSON.parse(readFileSync(new URL('../.family-plan.local.json', import.meta.url), 'utf8'));
 async function query(request) {
@@ -1371,6 +1424,113 @@ const week = monday();
 const insertedMeals = await query(db.from('weekly_menu').upsert(FIXED_MENU.map(meal => ({ ...meal, week_start: week })), { onConflict: 'week_start,day_of_week,meal_type', ignoreDuplicates: true }).select('id'));
 const insertedTemplates = await query(db.from('menu_templates').upsert(FIXED_MENU.map(({ is_skipped, ...meal }) => meal), { onConflict: 'day_of_week,meal_type', ignoreDuplicates: true }).select('id'));
 console.log(JSON.stringify({ week, insertedTasks: insertedTasks.length, insertedProducts: insertedItems.length, insertedMeals: insertedMeals.length, insertedTemplates: insertedTemplates.length }));
+```
+
+### `src/components/AuthGate.jsx`
+
+```jsx
+import { useEffect, useState } from 'react';
+import { House, LockKeyhole, LogOut, RefreshCw } from 'lucide-react';
+import { useRegisterSW } from 'virtual:pwa-register/react';
+import { supabase } from '../services/supabaseClient.js';
+import { usernameEmail, validMembership } from '../lib/auth.js';
+import { cachedHousehold } from '../services/householdService.js';
+
+export default function AuthGate({ children }) {
+  const [session, setSession] = useState(undefined);
+  const [account, setAccount] = useState(null);
+  const [checking, setChecking] = useState(true);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [attempt, setAttempt] = useState(0);
+  const { needRefresh: [needRefresh], updateServiceWorker } = useRegisterSW();
+  useEffect(() => {
+    cachedHousehold();
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, next) => setSession(next));
+    return () => subscription.unsubscribe();
+  }, []);
+  useEffect(() => {
+    let active = true;
+    setAccount(null);
+    if (session === undefined) return;
+    if (!session) { setChecking(false); return; }
+    setChecking(true);
+    supabase.from('household_members').select('user_id,username,profile').eq('user_id', session.user.id).maybeSingle()
+      .then(({ data, error: failure }) => {
+        if (!active) return;
+        if (failure) setError('No se ha podido comprobar el acceso. Revisa tu conexión y vuelve a intentarlo.');
+        else if (!validMembership(data, session.user.id)) setError('Esta cuenta no tiene acceso a este hogar.');
+        else { setAccount(data); setError(''); }
+        setChecking(false);
+      }).catch(() => { if (active) { setError('No se ha podido comprobar el acceso. Revisa tu conexión.'); setChecking(false); } });
+    return () => { active = false; };
+  }, [session, attempt]);
+  async function login(event) {
+    event.preventDefault(); setBusy(true); setError('');
+    try {
+      const { error: failure } = await supabase.auth.signInWithPassword({ email: usernameEmail(username), password });
+      if (failure) throw new Error(failure.status === 429 ? 'Demasiados intentos. Espera unos minutos.' : 'No se pudo entrar. Comprueba el usuario, la contraseña y la conexión.');
+      setPassword('');
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  }
+  async function logout() {
+    setAccount(null); setBusy(true); setError(''); cachedHousehold();
+    try {
+      const { error: failure } = await supabase.auth.signOut({ scope: 'local' });
+      if (failure) setError('No se pudo cerrar la sesión. Conéctate y vuelve a intentarlo.');
+    } finally { setBusy(false); }
+  }
+  if (account) return children(account, logout);
+  return <main className="auth-page"><section className="auth-card" aria-labelledby="auth-title">
+    <a className="brand" href={import.meta.env.BASE_URL}><span className="brand-icon"><House size={25} /></span>CloudHouse<span className="brand-dot">.</span></a>
+    <span className="auth-lock"><LockKeyhole size={28} strokeWidth={1.5} /></span>
+    <p className="eyebrow">NUESTRO HOGAR</p><h1 id="auth-title">Bienvenido a casa.</h1>
+    <p className="muted">Tu casa, organizada. Entra para continuar.</p>
+    {checking ? <p role="status" className="auth-checking"><RefreshCw className="spin" size={20} />Comprobando tu sesión…</p> : session ? <div className="form-stack"><button className="button primary" disabled={busy} onClick={() => setAttempt(v => v + 1)}>Reintentar conexión</button><button className="button secondary" disabled={busy} onClick={logout}><LogOut size={18} />Cerrar sesión</button></div> : <form className="form-stack" onSubmit={login}>
+      <label>Usuario<input name="username" autoComplete="username" autoCapitalize="none" spellCheck={false} required maxLength={40} value={username} onChange={e => setUsername(e.target.value)} placeholder="Tu nombre de usuario" /></label>
+      <label>Contraseña<input name="password" type="password" autoComplete="current-password" required value={password} onChange={e => setPassword(e.target.value)} placeholder="Tu contraseña" /></label>
+      <button className="button primary" type="submit" disabled={busy}><LockKeyhole size={18} />{busy ? 'Entrando…' : 'Entrar en casa'}</button>
+    </form>}
+    {error && <p className="auth-error" role="alert">{error}</p>}
+    {needRefresh && <button className="button secondary" onClick={() => updateServiceWorker(true)}>Actualizar app</button>}
+    <p className="small muted auth-footnote">Acceso reservado a las cuentas de este hogar.</p>
+  </section></main>;
+}
+```
+
+### `src/lib/auth.js`
+
+```js
+export function usernameEmail(value) {
+  const username = value.trim().toLowerCase();
+  if (!/^[a-z0-9_-]{1,40}$/.test(username)) throw new Error('Escribe tu nombre de usuario, sin espacios.');
+  return `${username}@users.cloudhouse.invalid`;
+}
+
+export function validMembership(member, userId) {
+  return Boolean(member && member.user_id === userId && ['Padre', 'Hijo'].includes(member.profile));
+}
+```
+
+### `scripts/authenticate.mjs`
+
+```js
+import { createInterface } from 'node:readline';
+import { usernameEmail } from '../src/lib/auth.js';
+
+export async function authenticateClients(clients) {
+  console.log('Introduce por stdin un JSON con username y password de un miembro (no se guarda).');
+  if (process.stdin.isTTY) console.log('Para ocultar la entrada en terminal, ejecuta primero: stty -echo');
+  const input = createInterface({ input: process.stdin, terminal: false });
+  const credentials = await new Promise(resolve => input.once('line', line => { input.close(); resolve(JSON.parse(line)); }));
+  for (const db of clients) {
+    const { error } = await db.auth.signInWithPassword({ email: usernameEmail(credentials.username), password: credentials.password });
+    if (error) throw new Error('No se pudo autenticar la cuenta de pruebas.');
+  }
+}
 ```
 
 ## 10. Guía breve de 5 pasos para subirlo a GitHub Pages con gh-pages y conectar las variables de entorno
@@ -1396,7 +1556,7 @@ console.log(JSON.stringify({ week, insertedTasks: insertedTasks.length, inserted
 5. En GitHub → Settings → Pages selecciona **Deploy from a branch**,
    rama **gh-pages**, carpeta **/(root)**. Abre
    `https://TU_USUARIO.github.io/CloudHouse/` en ambos móviles.
-   Elige el perfil e instala desde el menú de Chrome o desde
+   Inicia sesión con una cuenta autorizada e instala desde el menú de Chrome o desde
    Safari → Compartir → Añadir a la pantalla de inicio.
 
 Para publicar actualizaciones: `git push origin main` y `npm run deploy`.
@@ -1408,3 +1568,5 @@ sujetos a sus límites. No se ha contratado ningún servicio de pago.
 Publicación de este proyecto: [CloudHouse](https://pep-vnd.github.io/CloudHouse/).
 
 Documentación consultada: [Tailwind](https://tailwindcss.com/docs/installation/using-vite), [Supabase Realtime](https://supabase.com/docs/guides/realtime/postgres-changes), [Open Food Facts](https://openfoodfacts.github.io/openfoodfacts-server/api/tutorial-off-api/), [Vite y Pages](https://vite.dev/guide/static-deploy.html#github-pages).
+
+El acceso requiere crear las cuentas y sus miembros como indica README.md, apartado «Acceso y datos». No incluyas contraseñas en el código.

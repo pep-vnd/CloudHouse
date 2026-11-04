@@ -11,7 +11,12 @@ function read(key) {
     return value && Array.isArray(value.inventory_items) && TABLES.every(t => value[t] === undefined || Array.isArray(value[t])) ? { ...empty(), ...value } : empty();
   } catch { return empty(); }
 }
-export function cachedHousehold() { return read(supabase ? CACHE_KEY : LOCAL_KEY); }
+export function cachedHousehold() {
+  if (!supabase) return read(LOCAL_KEY);
+  // Retira la copia anterior, creada antes de incorporar el acceso privado.
+  try { localStorage.removeItem(CACHE_KEY); localStorage.removeItem('cloudhouse.profile'); } catch {}
+  return empty();
+}
 export async function loadHousehold() {
   if (configurationError) throw new Error(configurationError);
   if (!supabase) return read(LOCAL_KEY);
@@ -24,7 +29,6 @@ export async function loadHousehold() {
     }
     return [t, rows];
   })));
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify(result)); } catch { /* La nube sigue siendo la fuente de datos. */ }
   return result;
 }
 async function localWrite(action) {

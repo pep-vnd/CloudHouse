@@ -1,3 +1,4 @@
+import { authenticateClients } from './authenticate.mjs';
 import assert from 'node:assert/strict';
 import { loadEnv } from 'vite';
 import { createClient } from '@supabase/supabase-js';
@@ -7,6 +8,7 @@ import { monday, normalize } from '../src/lib/domain.js';
 const env = loadEnv('production', process.cwd(), '');
 assert.ok(env.VITE_SUPABASE_URL && env.VITE_SUPABASE_ANON_KEY, 'Falta configurar Supabase');
 const db = createClient(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_ANON_KEY, { auth: { persistSession: false } });
+await authenticateClients([db]);
 // Datos familiares locales: este archivo NO se incluye en Git ni en el bundle.
 const { tasks: FAMILY_TASKS, menu: FIXED_MENU, products: BASIC_PRODUCTS } = JSON.parse(readFileSync(new URL('../.family-plan.local.json', import.meta.url), 'utf8'));
 async function query(request) {

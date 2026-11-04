@@ -1,3 +1,4 @@
+import { authenticateClients } from './authenticate.mjs';
 import assert from 'node:assert/strict';
 import { loadEnv } from 'vite';
 import { createClient } from '@supabase/supabase-js';
@@ -8,6 +9,7 @@ assert.ok(env.VITE_SUPABASE_URL && env.VITE_SUPABASE_ANON_KEY, 'Configura .env.l
 const options = { auth: { persistSession: false, autoRefreshToken: false } };
 const a = createClient(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_ANON_KEY, options);
 const b = createClient(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_ANON_KEY, options);
+await authenticateClients([a, b]);
 const tag = `CloudHouse QA ${crypto.randomUUID()}`;
 const created = [];
 const events = new Set();

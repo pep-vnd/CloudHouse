@@ -43,7 +43,7 @@ Los datos locales no se migran automáticamente cuando se activa Supabase.
 5. En GitHub → Settings → Pages selecciona **Deploy from a branch**,
    rama **gh-pages**, carpeta **/(root)**. Abre
    `https://TU_USUARIO.github.io/CloudHouse/` en ambos móviles.
-   Elige el perfil e instala desde el menú de Chrome o desde
+   Inicia sesión con una cuenta autorizada e instala desde el menú de Chrome o desde
    Safari → Compartir → Añadir a la pantalla de inicio.
 
 Para publicar actualizaciones: `git push origin main` y `npm run deploy`.
@@ -60,8 +60,11 @@ node scripts/verify-cloud.mjs
 ```
 
 La última comprobación requiere `.env.local` y conexión. Crea registros
-temporales identificados y los elimina al terminar. Verifica RLS con el rol
-anónimo, actualizaciones concurrentes, reposición, duplicados y Realtime.
+temporales identificados y los elimina al terminar. Solicita por stdin las credenciales de una cuenta autorizada.
+Verifica actualizaciones concurrentes, reposición, duplicados y Realtime.
+`node scripts/verify-access.mjs` comprueba además el rechazo anónimo y las dos cuentas;
+recibe por stdin un array JSON de objetos con username, password y profile.
+No guardes las credenciales en archivos ni argumentos de comandos.
 
 ## Comportamiento
 
@@ -74,9 +77,10 @@ anónimo, actualizaciones concurrentes, reposición, duplicados y Realtime.
 - Las tareas se organizan por día y franja horaria. El completado se guarda por
   fecha, así que una rutina vuelve a estar pendiente en su siguiente aparición.
   El reinicio manual afecta al día o semana seleccionados, conservando el resto del historial.
-- La PWA almacena su interfaz y la última copia de datos. Sin conexión puedes
-  consultar; las escrituras a Supabase requieren conexión y muestran un error
-  si no se pueden guardar. No se confirman escrituras que no han llegado al servidor.
+- La PWA almacena su interfaz, pero los datos del hogar en la nube se mantienen
+  solo en memoria mientras la sesión está abierta. Sin conexión se conserva la
+  vista ya cargada; una nueva apertura necesita conexión para comprobar el acceso.
+  Al cerrar sesión se desmonta el hogar y se elimina la caché antigua.
 - El modo local utiliza Web Locks cuando están disponibles para coordinar pestañas.
   El modo nube usa PostgreSQL; no depende de Web Locks.
 - La cámara necesita HTTPS o localhost y permiso del navegador. También hay
@@ -86,12 +90,23 @@ anónimo, actualizaciones concurrentes, reposición, duplicados y Realtime.
 
 ## Acceso y datos
 
-El SQL implementa las **políticas RLS abiertas solicitadas** para las tablas
-del hogar. Cualquiera que obtenga la URL y la clave pública puede leer y modificar
-el hogar. GitHub Pages es público. El selector Papá/Hijo no autentica y un PIN
-solo en el frontend tampoco protegería la base de datos. Usa este despliegue
-para los datos domésticos no sensibles previstos; para acceso privado real,
-añade Supabase Auth y políticas vinculadas a un hogar antes de ampliar el uso.
+La web y su código son públicos; los datos requieren Supabase Auth y pertenecer
+  a `household_members`. Los visitantes anónimos no pueden leer ni escribir las
+  tablas o ejecutar sus funciones. Los miembros no pueden cambiar su perfil ni
+  crear otros miembros. No hay registro público en la aplicación.
+
+Para provisionar un hogar nuevo, crea las cuentas desde Authentication → Users,
+con el identificador `nombre@users.cloudhouse.invalid`, contraseña y autoconfirmación,
+sin enviar correo. Registra sus UUID en `household_members` desde SQL Editor,
+con `username` y `profile` (`Padre` o `Hijo`). Desactiva los nuevos registros en
+Authentication → Sign In / Providers. Los usuarios escriben solamente su nombre
+en CloudHouse. Estos identificadores no son buzones: para recuperar una contraseña,
+el administrador debe cambiarla en Supabase. No publiques datos de cuentas ni contraseñas.
+
+En proyectos existentes aplica `supabase/migrations/20261104_private_access.sql`.
+El script completo `supabase/schema.sql` también incluye la protección dentro de
+una única transacción. Las antiguas migraciones son históricas: no las reapliques
+por separado después de activar el acceso privado.
 
 No se incluye la contraseña de PostgreSQL ni ninguna clave administrativa
 en el repositorio. `.env.local` está excluido de Git.

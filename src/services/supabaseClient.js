@@ -6,7 +6,7 @@ export const isCloudConfigured = Boolean(url && key);
 export const configurationError = Boolean(url) !== Boolean(key)
   ? 'Falta la URL o la clave pública de Supabase. Completa ambas variables y vuelve a desplegar.' : null;
 export const supabase = isCloudConfigured ? createClient(url, key, {
-  auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
   realtime: { params: { eventsPerSecond: 10 } },
 }) : null;
 
