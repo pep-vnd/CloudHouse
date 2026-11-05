@@ -4,7 +4,7 @@
 npm create vite@latest CloudHouse -- --template react
 cd CloudHouse
 npm install
-npm install @supabase/supabase-js html5-qrcode lucide-react
+npm install @supabase/supabase-js html5-qrcode lucide-react @zxing/library
 npm install -D tailwindcss @tailwindcss/vite vite-plugin-pwa gh-pages
 ```
 
@@ -605,7 +605,7 @@ function HouseholdApp({ account, onLogout }) {
     {error && createPortal(<div className="error-toast" role="alert"><div><strong>No se ha completado la operación</strong><p>{error}</p></div><button className="icon-button" aria-label="Cerrar error" onClick={() => setError('')}><X size={20} /></button></div>, document.querySelector('dialog[open]') || document.body)}
     {!account && profileOpen && <Modal title="Bienvenido a casa" onClose={() => setProfileOpen(false)}><p className="muted">Elige tu perfil. Lo recordaremos en este dispositivo.</p><div className="profile-options"><button onClick={() => choose('Padre')}><span className="avatar-large dad"><UserRound size={33} /></span><strong>Soy Papá</strong><span>Juntos, todo es más fácil.</span></button><button onClick={() => choose('Hijo')}><span className="avatar-large son"><UserRound size={33} /></span><strong>Soy Hijo</strong><span>Yo también pongo mi parte.</span></button></div><p className="small muted">Puedes cambiar de perfil cuando quieras desde la esquina superior.</p></Modal>}
     {scanner && <ScannerModal onClose={() => setScanner(false)} onDetected={detected} busy={busy} />}
-    {product && <ProductModal product={product} shopping={tab === 'shopping'} onClose={() => setProduct(null)} busy={busy} run={run} />}
+    {product && !scanner && <ProductModal product={product} shopping={tab === 'shopping'} onClose={() => setProduct(null)} busy={busy} run={run} />}
     {settings && <Modal title="Tu hogar, siempre a mano" onClose={() => setSettings(false)}><div className="form-stack"><div className="settings-status"><Cloud size={24} /><div><strong>{stateText}</strong><p>{isCloudConfigured ? 'Los cambios se comparten entre Papá e Hijo a través de Supabase.' : 'Este dispositivo funciona de forma independiente. Para compartir el hogar, conecta Supabase y vuelve a publicar la app.'}</p></div></div><h3>Instalar CloudHouse</h3><p className="muted">En iPhone: abre en Safari, pulsa Compartir y «Añadir a la pantalla de inicio». En Android: abre el menú de Chrome y pulsa «Instalar aplicación».</p>{install && <button className="button primary" onClick={async () => { await install.prompt(); await install.userChoice; setInstall(null); }}><Download size={18} />Instalar aplicación</button>}<p className="small muted">{account ? `Sesión de ${account.username} · ${account.profile}. Solo las cuentas autorizadas pueden acceder al hogar.` : "El modo local guarda los datos solo en este navegador."}</p>{account ? <button className="button secondary" onClick={onLogout}>Cerrar sesión</button> : <button className="button secondary" onClick={() => { setSettings(false); setProfileOpen(true); }}>Cambiar perfil</button>}<a className="small" href="https://world.openfoodfacts.org" target="_blank" rel="noreferrer">Productos: Open Food Facts · ODbL · Fotos CC BY-SA</a></div></Modal>}
   </div>;
 }
@@ -615,14 +615,16 @@ function HouseholdApp({ account, onLogout }) {
 
 ```jsx
 import { useEffect, useRef, useState } from 'react';
-import { Camera, ScanBarcode } from 'lucide-react';
+import { Camera, ScanBarcode, Flashlight, Minus, Plus } from 'lucide-react';
 import Modal from './Modal.jsx';
 import { isValidBarcode } from '../lib/domain.js';
 import { createCameraSession } from '../lib/cameraSession.js';
+import { cameraConfig, cameraCapabilities, applyCameraControl } from '../lib/cameraControls.js';
 
 export default function ScannerModal({ onClose, onDetected, busy }) {
   const host = useRef(null);
   const scanner = useRef(null);
+  const detailedScan = useRef(null);
   const startLock = useRef(false);
   const attempt = useRef(0);
   const alive = useRef(true);
@@ -633,8 +635,17 @@ export default function ScannerModal({ onClose, onDetected, busy }) {
   const [startingCamera, setStartingCamera] = useState(false);
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
+  const [devices, setDevices] = useState([]);
+  const [selectedCamera, setSelectedCamera] = useState('');
+  const [capabilities, setCapabilities] = useState({ torch: false, focus: false, zoom: null });
+  const [torch, setTorch] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [adjusting, setAdjusting] = useState(false);
+  const adjustment = useRef(false);
   function stop() {
     attempt.current++;
+    detailedScan.current?.();
+    detailedScan.current = null;
     scanner.current?.stop();
     scanner.current = null;
   }
@@ -653,11 +664,12 @@ export default function ScannerModal({ onClose, onDetected, busy }) {
       if (ok && alive.current) onClose();
     } finally { locked.current = false; }
   }
-  async function start() {
-    if (startLock.current || camera) return;
+  async function start(deviceId = selectedCamera) {
+    if (startLock.current || busy || locked.current) return;
+    stop();
     startLock.current = true;
     const currentAttempt = ++attempt.current;
-    setError(''); setStartingCamera(true);
+    setError(''); setCamera(false); setTorch(false); setStartingCamera(true);
     let root;
     try {
       if (!window.isSecureContext || !navigator.mediaDevices) throw new Error('La cámara necesita HTTPS. Puedes escribir el código abajo.');
@@ -668,21 +680,55 @@ export default function ScannerModal({ onClose, onDetected, busy }) {
       root.className = 'camera-reader';
       host.current.append(root);
       const reader = new Html5Qrcode(root.id, { formatsToSupport: [Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8], verbose: false });
-      const session = createCameraSession({ reader, root, config: {
-        fps: 10, qrbox: (width, height) => ({ width: Math.max(50, Math.min(280, width - 24)), height: Math.max(50, Math.min(140, height - 24)) }),
-      }, onDetected: raw => { void detect(raw); } });
+      const session = createCameraSession({ reader, root, config: cameraConfig(deviceId), onDetected: raw => { void detect(raw); } });
       scanner.current = session;
       await session.ready;
-      if (alive.current && currentAttempt === attempt.current) setCamera(true);
+      if (!alive.current || currentAttempt !== attempt.current) return;
+      setCamera(true);
+      const track = session.getTrack();
+      const caps = cameraCapabilities(track);
+      setCapabilities(caps);
+      const settings = track?.getSettings?.() || {};
+      setSelectedCamera(settings.deviceId || deviceId);
+      setZoom(settings.zoom || caps.zoom?.min || 1);
+      if (caps.focus) void applyCameraControl(track, 'focusMode', 'continuous').catch(() => {});
+      void navigator.mediaDevices.enumerateDevices().then(list => {
+        if (alive.current && currentAttempt === attempt.current) setDevices(list.filter(d => d.kind === 'videoinput'));
+      }).catch(() => {});
+      void import('../lib/barcodeDecoder.js').then(({ startDetailedScan }) => {
+        if (alive.current && currentAttempt === attempt.current) detailedScan.current = startDetailedScan(session.getVideo(), raw => { void detect(raw); });
+      }).catch(() => { /* La lectura normal sigue disponible si falla la descarga. */ });
     } catch (err) {
       stop(); root?.remove();
       if (alive.current && err?.name !== 'AbortError') setError(err?.message || 'No se ha podido abrir la cámara. Revisa el permiso o escribe el código.');
     } finally { startLock.current = false; if (alive.current) setStartingCamera(false); }
   }
+  async function adjust(name, value) {
+    if (adjustment.current || !camera) return;
+    adjustment.current = true; setAdjusting(true); setError('');
+    const session = scanner.current;
+    try {
+      const result = await applyCameraControl(session?.getTrack(), name, value);
+      if (alive.current && scanner.current === session) {
+        if (name === 'torch') setTorch(result); else setZoom(result);
+      }
+    } catch {
+      if (alive.current && scanner.current === session) setError('Safari no ha podido aplicar ese ajuste. Puedes cambiar de cámara o mejorar la luz.');
+    } finally { adjustment.current = false; if (alive.current) setAdjusting(false); }
+  }
   return <Modal title="Escanear un producto" onClose={onClose} busy={busy}>
-    <p className="muted">Apunta al código de barras. Si ya está en casa, sumaremos una unidad.</p>
+    <p className="muted">Coloca todo el código horizontal dentro del marco, con un poco de blanco a cada lado. Si ya está en casa, sumaremos una unidad.</p>
     <div className="camera-box"><div ref={host} className="camera-host" />{!camera && !startingCamera && <ScanBarcode size={70} strokeWidth={1} />}</div>
-    {!camera && <button className="button primary full" onClick={start} disabled={startingCamera || busy}><Camera size={19} />{startingCamera ? 'Abriendo cámara…' : 'Activar cámara'}</button>}
+    {!camera && <button className="button primary full" onClick={() => start()} disabled={startingCamera || busy}><Camera size={19} />{startingCamera ? 'Abriendo cámara…' : 'Activar cámara'}</button>}
+    {camera && <div className="scanner-controls">
+      <p className="scanner-tip">Empieza a unos 20–30 cm. Si se ve borroso, aleja un poco el móvil; usa zoom para ampliar sin acercarte tanto.</p>
+      <div className="scanner-control-row">
+        {capabilities.torch && <button className={`button ${torch ? 'primary' : 'secondary'}`} aria-pressed={torch} disabled={adjusting || busy} onClick={() => adjust('torch', !torch)}><Flashlight size={18} />{torch ? 'Apagar linterna' : 'Encender linterna'}</button>}
+        {capabilities.zoom && <div className="scanner-zoom" role="group" aria-label="Zoom de la cámara"><button className="icon-button" aria-label="Reducir zoom" disabled={adjusting || busy || zoom <= capabilities.zoom.min} onClick={() => adjust('zoom', zoom - Math.max(0.5, capabilities.zoom.step))}><Minus size={18} /></button><output aria-live="polite">{zoom.toFixed(1)}×</output><button className="icon-button" aria-label="Aumentar zoom" disabled={adjusting || busy || zoom >= capabilities.zoom.max} onClick={() => adjust('zoom', zoom + Math.max(0.5, capabilities.zoom.step))}><Plus size={18} /></button></div>}
+      </div>
+      <p className="small muted">{capabilities.torch ? 'La linterna ayuda con poca luz. Apágala si crea reflejos en el envase.' : 'Safari no ofrece linterna en esta cámara. Prueba con más luz, evitando reflejos.'}</p>
+    </div>}
+    {devices.length > 1 && <label className="scanner-camera-choice">Cámara<select value={selectedCamera} disabled={startingCamera || busy || adjusting} onChange={e => { const id = e.target.value; setSelectedCamera(id); if (camera) void start(id); }}><option value="">Trasera automática</option>{devices.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Cámara ${index + 1}`}</option>)}</select><span className="small muted">Si no enfoca de cerca, prueba otra cámara trasera.</span></label>}
     {(camera || startingCamera) && <button className="button secondary full" disabled={busy} onClick={() => { stop(); setCamera(false); }}>Apagar cámara</button>}
     <form className="form-stack scanner-form" onSubmit={e => { e.preventDefault(); void detect(code); }}>
       <label>También puedes escribir el código<input inputMode="numeric" autoComplete="off" maxLength={13} placeholder="EAN-8 o EAN-13" value={code} onChange={e => setCode(e.target.value)} required /></label>
@@ -922,15 +968,20 @@ export default function ProductModal({ product, shopping, busy, run, onClose }) 
 ```jsx
 import { useEffect, useRef } from 'react';
 import { X } from 'lucide-react';
+import { lockModalScroll } from '../lib/modalScroll.js';
 
 export default function Modal({ title, children, onClose, busy = false, wide = false }) {
   const dialog = useRef(null);
   useEffect(() => {
     const previous = document.activeElement;
-    dialog.current.showModal();
-    const overflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => { document.body.style.overflow = overflow; previous?.focus(); };
+    const element = dialog.current;
+    element.showModal();
+    const unlock = lockModalScroll(document.body);
+    return () => {
+      element.close();
+      unlock();
+      if (previous?.isConnected && !document.querySelector('dialog[open]')) previous.focus({ preventScroll: true });
+    };
   }, []);
   return <dialog ref={dialog} className={`modal ${wide ? 'wide' : ''}`} aria-label={title}
     onCancel={e => { e.preventDefault(); if (!busy) onClose(); }}>
@@ -1247,6 +1298,16 @@ main { max-width: 1340px; padding: 30px 44px 35px; margin: auto; }
 .auth-footnote { margin-top: 24px; text-align: center; }
 .auth-checking { display: flex; align-items: center; gap: 10px; margin: 28px 0; }
 @media (max-width: 480px) { .auth-card { padding: 28px 22px; } }
+
+.scanner-controls { display: grid; gap: 10px; margin: 12px 0; }
+.scanner-tip { font-size: 13px; line-height: 1.55; color: #4c6547; }
+.scanner-control-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.scanner-control-row .button { flex: 1; min-height: 46px; }
+.scanner-zoom { display: flex; align-items: center; border: 1px solid #dbe2ce; border-radius: 10px; background: #fff; }
+.scanner-zoom output { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
+.scanner-camera-choice { display: grid; gap: 7px; margin: 12px 0; font-size: 13px; }
+.scanner-camera-choice select { width: 100%; min-width: 0; min-height: 46px; padding: 8px; border: 1px solid #dbe2ce; border-radius: 8px; background: #fff; font-size: 16px; }
+.modal { overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
 ```
 
 ### `vite.config.js`
@@ -1323,6 +1384,7 @@ export default defineConfig(({ mode }) => {
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.0.0",
+    "@zxing/library": "^0.23.0",
     "html5-qrcode": "^2.3.8",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
@@ -1614,7 +1676,124 @@ export function createCameraSession({ reader, root, config, onDetected, timeoutM
     stop();
     observer.disconnect();
   });
-  return { ready, stop };
+  return { ready, stop, getVideo: video, getTrack: () => video()?.srcObject?.getVideoTracks?.()[0] };
+}
+```
+
+### `src/lib/modalScroll.js`
+
+```js
+const locks = new WeakMap();
+
+// Las ventanas pueden desmontarse en distinto orden al que se abrieron.
+export function lockModalScroll(body) {
+  let state = locks.get(body);
+  if (!state) {
+    state = { count: 0, overflow: body.style.overflow };
+    locks.set(body, state);
+    body.style.overflow = 'hidden';
+  }
+  state.count++;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (--state.count === 0) {
+      body.style.overflow = state.overflow;
+      locks.delete(body);
+    }
+  };
+}
+```
+
+### `src/lib/cameraControls.js`
+
+```js
+export function cameraConfig(deviceId) {
+  return {
+    fps: 6, disableFlip: true,
+    videoConstraints: {
+      ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: 'environment' } }),
+      width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30, max: 30 },
+    },
+    qrbox: (width, height) => ({ width: Math.floor(width * 0.9), height: Math.floor(height * 0.55) }),
+  };
+}
+
+export function cameraCapabilities(track) {
+  let caps = {};
+  try { caps = track?.getCapabilities?.() || {}; } catch {}
+  const range = caps.zoom;
+  const maxZoom = range ? Math.min(range.max, Math.max(3, range.min)) : 0;
+  return {
+    torch: caps.torch === true || (Array.isArray(caps.torch) && caps.torch.includes(true)),
+    focus: Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous'),
+    zoom: range && Number.isFinite(range.min) && Number.isFinite(range.max) && maxZoom > range.min
+      ? { min: range.min, max: maxZoom, step: range.step || 0.1 } : null,
+  };
+}
+
+export async function applyCameraControl(track, name, value) {
+  if (!track || track.readyState === 'ended') throw new Error('La cámara está apagada.');
+  const caps = cameraCapabilities(track);
+  if ((name === 'torch' && !caps.torch) || (name === 'focusMode' && !caps.focus) || (name === 'zoom' && !caps.zoom)) throw new Error('Esta cámara no permite ese ajuste.');
+  if (name === 'zoom') {
+    if (!Number.isFinite(value)) throw new Error('Zoom inválido.');
+    value = Math.min(caps.zoom.max, Math.max(caps.zoom.min, value));
+    value = Math.min(caps.zoom.max, caps.zoom.min + Math.round((value - caps.zoom.min) / caps.zoom.step) * caps.zoom.step);
+  }
+  // Safari puede devolver un valor de torch antiguo en getSettings().
+  await track.applyConstraints({ [name]: value, advanced: [{ [name]: value }] });
+  return value;
+}
+```
+
+### `src/lib/barcodeDecoder.js`
+
+```js
+import { MultiFormatReader, BarcodeFormat, DecodeHintType, RGBLuminanceSource, BinaryBitmap, HybridBinarizer } from '@zxing/library';
+import { isValidBarcode } from './domain.js';
+
+export function createBarcodeDecoder() {
+  const reader = new MultiFormatReader();
+  reader.setHints(new Map([
+    [DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.EAN_13, BarcodeFormat.EAN_8]],
+    [DecodeHintType.TRY_HARDER, true],
+  ]));
+  return (pixels, width, height) => {
+    const result = reader.decodeWithState(new BinaryBitmap(new HybridBinarizer(new RGBLuminanceSource(pixels, width, height))));
+    const code = result.getText();
+    return isValidBarcode(code) ? code : null;
+  };
+}
+
+// El lector de html5-qrcode analiza a tamaño de pantalla (~300 px).
+// Esta segunda pasada conserva hasta 1280 px del fotograma, sin subir imágenes.
+export function startDetailedScan(video, onDetected) {
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d', { willReadFrequently: true });
+  const decode = createBarcodeDecoder();
+  let stopped = false;
+  let timer;
+  const tick = () => {
+    if (stopped) return;
+    if (document.visibilityState === 'visible' && video.readyState >= 2 && !video.paused && video.videoWidth) {
+      try {
+        const sw = Math.floor(video.videoWidth * 0.9), sh = Math.floor(video.videoHeight * 0.55);
+        const scale = Math.min(1, 1280 / sw);
+        canvas.width = Math.floor(sw * scale); canvas.height = Math.floor(sh * scale);
+        context.drawImage(video, (video.videoWidth - sw) / 2, (video.videoHeight - sh) / 2, sw, sh, 0, 0, canvas.width, canvas.height);
+        const rgba = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        const luminance = new Uint8ClampedArray(canvas.width * canvas.height);
+        for (let i = 0; i < luminance.length; i++) luminance[i] = (rgba[i * 4] + 2 * rgba[i * 4 + 1] + rgba[i * 4 + 2]) / 4;
+        const code = decode(luminance, canvas.width, canvas.height);
+        if (code && !stopped) onDetected(code);
+      } catch { /* No encontrar un código en un fotograma es normal. */ }
+    }
+    if (!stopped) timer = setTimeout(tick, 400);
+  };
+  timer = setTimeout(tick, 500);
+  return () => { stopped = true; clearTimeout(timer); canvas.width = 0; canvas.height = 0; };
 }
 ```
 

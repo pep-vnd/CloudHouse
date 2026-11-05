@@ -63,5 +63,5 @@ export function createCameraSession({ reader, root, config, onDetected, timeoutM
     stop();
     observer.disconnect();
   });
-  return { ready, stop };
+  return { ready, stop, getVideo: video, getTrack: () => video()?.srcObject?.getVideoTracks?.()[0] };
 }

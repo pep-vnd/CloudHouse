@@ -83,6 +83,10 @@ No guardes las credenciales en archivos ni argumentos de comandos.
   Al cerrar sesión se desmonta el hogar y se elimina la caché antigua.
 - El modo local utiliza Web Locks cuando están disponibles para coordinar pestañas.
   El modo nube usa PostgreSQL; no depende de Web Locks.
+- El escáner solicita resolución HD, intenta enfoque continuo y permite linterna,
+  zoom y elección de lente según las capacidades de la cámara y del navegador.
+  Una segunda lectura local conserva hasta 1280 píxeles del fotograma; las imágenes
+  no se envían a servidores. Los controles físicos requieren validación en cada móvil.
 - La cámara necesita HTTPS o localhost y permiso del navegador. También hay
   entrada manual del EAN y creación manual cuando OFF no conoce el producto.
 - «Sin gluten» solo se infiere con una etiqueta explícita y sin alérgenos o

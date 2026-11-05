@@ -249,3 +249,13 @@ main { max-width: 1340px; padding: 30px 44px 35px; margin: auto; }
 .auth-footnote { margin-top: 24px; text-align: center; }
 .auth-checking { display: flex; align-items: center; gap: 10px; margin: 28px 0; }
 @media (max-width: 480px) { .auth-card { padding: 28px 22px; } }
+
+.scanner-controls { display: grid; gap: 10px; margin: 12px 0; }
+.scanner-tip { font-size: 13px; line-height: 1.55; color: #4c6547; }
+.scanner-control-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.scanner-control-row .button { flex: 1; min-height: 46px; }
+.scanner-zoom { display: flex; align-items: center; border: 1px solid #dbe2ce; border-radius: 10px; background: #fff; }
+.scanner-zoom output { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
+.scanner-camera-choice { display: grid; gap: 7px; margin: 12px 0; font-size: 13px; }
+.scanner-camera-choice select { width: 100%; min-width: 0; min-height: 46px; padding: 8px; border: 1px solid #dbe2ce; border-radius: 8px; background: #fff; font-size: 16px; }
+.modal { overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
