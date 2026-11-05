@@ -7,7 +7,7 @@ menú por semanas y tareas para Papá e Hijo, con instalación PWA.
 
 ## Ejecutar
 
-Node.js 22.12 o posterior.
+Node.js 24 o posterior.
 
 ```bash
 npm ci

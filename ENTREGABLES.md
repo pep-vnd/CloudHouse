@@ -1397,6 +1397,9 @@ export default defineConfig(({ mode }) => {
     "tailwindcss": "^4.0.0",
     "vite": "^7.0.0",
     "vite-plugin-pwa": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }
 ```
@@ -1751,17 +1754,17 @@ export async function applyCameraControl(track, name, value) {
 ### `src/lib/barcodeDecoder.js`
 
 ```js
-import { MultiFormatReader, BarcodeFormat, DecodeHintType, RGBLuminanceSource, BinaryBitmap, HybridBinarizer } from '@zxing/library';
+import { MultiFormatOneDReader, BarcodeFormat, DecodeHintType, RGBLuminanceSource, BinaryBitmap, HybridBinarizer } from '@zxing/library';
 import { isValidBarcode } from './domain.js';
 
 export function createBarcodeDecoder() {
-  const reader = new MultiFormatReader();
-  reader.setHints(new Map([
+  const hints = new Map([
     [DecodeHintType.POSSIBLE_FORMATS, [BarcodeFormat.EAN_13, BarcodeFormat.EAN_8]],
     [DecodeHintType.TRY_HARDER, true],
-  ]));
+  ]);
+  const reader = new MultiFormatOneDReader(hints);
   return (pixels, width, height) => {
-    const result = reader.decodeWithState(new BinaryBitmap(new HybridBinarizer(new RGBLuminanceSource(pixels, width, height))));
+    const result = reader.decode(new BinaryBitmap(new HybridBinarizer(new RGBLuminanceSource(pixels, width, height))), hints);
     const code = result.getText();
     return isValidBarcode(code) ? code : null;
   };
